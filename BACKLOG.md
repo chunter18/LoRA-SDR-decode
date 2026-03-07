@@ -2,9 +2,10 @@
 
 ## Current Status
 - Preamble detection WORKS on live SF12 beacon (~19 dB SNR, 6-9 chirps per detection)
+- Symbol demodulation WORKS on synthetic signals (all SFs, with noise)
 - Beacon: RFM95W on Arduino, SF12/125kHz, "HELLO" every 3 seconds
 - SDR: Pluto via rtl_433 -w - (CS16 format, 1 MHz sample rate)
-- 43/43 tests passing
+- 55/55 tests passing
 
 ## Known Issues to Fix First
 
@@ -36,22 +37,16 @@ the old ~4 dB). Metric is consistent across FFT sizes (tested SF7 and SF12).
 
 ## Next Steps (in order)
 
-### Step 1: Symbol Demodulation
-After detecting a preamble, extract the data symbols that follow it.
+### ~~Step 1: Symbol Demodulation~~ DONE
+chirp_demod.py implements:
+- `generate_lora_frame()` — synthetic frame generator for testing
+- `find_sfd()` — locates SFD down-chirps via up/down energy comparison
+- `extract_symbols()` — dechirp + FFT per symbol, full FFT gives direct
+  bin-to-symbol mapping regardless of oversampling rate
+- `demodulate()` — full pipeline: decimate → detect → find_sfd → extract
 
-What to build:
-- After preamble detection, identify the sync words (2 down-chirps that mark
-  end of preamble / start of data)
-- For each subsequent symbol period, de-chirp + FFT to get the symbol value
-  (the FFT peak bin, mapped to 0..2^SF-1)
-- Return list of raw symbol values
-
-Key challenge: need to find exact symbol boundary. The preamble detection
-gives approximate alignment (quarter-symbol precision). May need to refine
-by trying sub-sample offsets and maximizing peak sharpness.
-
-Test approach: transmit known payload "HELLO" repeatedly, verify we get
-consistent raw symbols.
+chirp_monitor.py `--demod` flag enables live symbol extraction (35-symbol
+blocks to fit full frame). NOT YET TESTED ON LIVE BEACON — next step.
 
 ### Step 2: LoRa Protocol Decode
 Convert raw symbols to bytes. This is the hard part — multiple layers:
@@ -91,7 +86,7 @@ the Python prototype is complete and we can think about the C port.
 lora/
   sdr_source.py        — IQ from rtl_433 (done)
   chirp_detect.py      — preamble detection (done, needs dedup)
-  chirp_demod.py       — NEW: symbol extraction from detected preamble
+  chirp_demod.py       — symbol extraction from detected preamble (done)
   lora_decode.py       — NEW: gray/interleave/hamming/whiten/CRC
   chirp_waterfall.py   — visualization (done)
   chirp_monitor.py     — CLI preamble detector (done)
@@ -99,7 +94,7 @@ lora/
   tests/
     test_chirp_detect.py   (done)
     test_sdr_source.py     (done)
-    test_chirp_demod.py    — NEW: test symbol extraction with synthetic signals
+    test_chirp_demod.py    — test symbol extraction with synthetic signals (done)
     test_lora_decode.py    — NEW: test each decode stage with known vectors
 ```
 
