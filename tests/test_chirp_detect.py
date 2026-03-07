@@ -140,8 +140,24 @@ class TestDechirpAndFFT:
         up = generate_chirp(FAST_PARAMS, direction='up')
         _, _, snr_db = dechirp_and_fft(noise, up)
 
-        # SNR should be low for pure noise
-        assert snr_db < 15
+        # With mean-based metric, noise baseline should be < 8 dB
+        assert snr_db < 8
+
+    def test_noise_snr_consistent_across_fft_sizes(self):
+        """Noise-only SNR should be similar regardless of FFT size."""
+        rng = np.random.default_rng(42)
+        snrs = []
+        for params in [FAST_PARAMS, SLOW_PARAMS]:
+            noise = (rng.standard_normal(params.symbol_samples) +
+                     1j * rng.standard_normal(params.symbol_samples)).astype(np.complex64)
+            up = generate_chirp(params, direction='up')
+            _, _, snr_db = dechirp_and_fft(noise, up)
+            snrs.append(snr_db)
+            assert snr_db < 8, f"SF{params.sf} noise SNR {snr_db:.1f} dB too high"
+        # The two should be within 3 dB of each other
+        assert abs(snrs[0] - snrs[1]) < 3, (
+            f"SF7={snrs[0]:.1f} vs SF12={snrs[1]:.1f} — too different"
+        )
 
 
 class TestDetectPreamble:
@@ -180,7 +196,7 @@ class TestDetectPreamble:
         noise = (rng.standard_normal(n_samples) +
                  1j * rng.standard_normal(n_samples)).astype(np.complex64)
 
-        detections = detect_preamble(noise, params, min_chirps=6, snr_threshold=15.0)
+        detections = detect_preamble(noise, params, min_chirps=6, snr_threshold=8.0)
         assert len(detections) == 0
 
     def test_too_short_signal(self):

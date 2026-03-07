@@ -4,7 +4,7 @@
 - Preamble detection WORKS on live SF12 beacon (~19 dB SNR, 6-9 chirps per detection)
 - Beacon: RFM95W on Arduino, SF12/125kHz, "HELLO" every 3 seconds
 - SDR: Pluto via rtl_433 -w - (CS16 format, 1 MHz sample rate)
-- 35/35 tests passing
+- 43/43 tests passing
 
 ## Known Issues to Fix First
 
@@ -27,11 +27,12 @@ gives ~6 dB lower values at 8192 bins vs 32768 bins (fewer noise bins to
 average over), causing detections to fall below threshold. Fix #3 (better SNR
 metric) should resolve this. Decimation will be used for symbol demodulation.
 
-### 3. Noise floor SNR metric
-The median-based SNR gives ~11-12 dB on pure noise, which is a known property
-of the metric (peak of N random variables exceeds median by ~11 dB for large N).
-Current threshold of 15 dB works but leaves only ~4 dB margin above noise.
-Consider using a better estimator (e.g., mean + k*std of magnitude bins).
+### ~~3. Noise floor SNR metric~~ DONE
+The old peak/median SNR gave ~11-12 dB on pure noise (max of N Rayleigh RVs
+exceeds median by ~sqrt(log2(N))). Fixed by subtracting the expected noise
+baseline: `corrected = raw - 10*log10(log2(N_bins))`. Now noise reads ~0 dB,
+signal ~7-8 dB, with default threshold lowered to 5.0 dB (~7 dB margin vs
+the old ~4 dB). Metric is consistent across FFT sizes (tested SF7 and SF12).
 
 ## Next Steps (in order)
 
@@ -104,9 +105,9 @@ lora/
 
 ### Key parameters confirmed from live testing
 - CS16 format, normalize by /32768.0
-- Noise floor SNR: ~11-12 dB (median-based metric)
-- Real chirp SNR: ~17-21 dB
-- Working threshold: 15 dB
+- Noise floor SNR: ~0 dB (corrected peak/median metric)
+- Real chirp SNR: ~7-8 dB
+- Working threshold: 5 dB
 - Frequency offset: ~60 kHz (bins ~30600-31200 out of 32768)
 - Beacon interval: 3 seconds
 - Preamble: 8 chirps = 262 ms at SF12

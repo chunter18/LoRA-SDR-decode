@@ -141,17 +141,23 @@ def dechirp_and_fft(samples, ref_chirp, n_fft=None):
     peak_bin = np.argmax(magnitudes)
     peak_power = magnitudes[peak_bin]
 
-    # SNR: peak power vs median (noise floor estimate)
+    # SNR: peak vs median, corrected for expected noise baseline.
+    # For N Rayleigh-distributed FFT bins, max/median ~ sqrt(log2(N)),
+    # giving a noise baseline of 10*log10(log2(N)) dB (~10-12 dB).
+    # Subtracting this gives ~0 dB on pure noise regardless of FFT size.
     median_power = np.median(magnitudes)
     if median_power > 0:
-        snr_db = 20 * np.log10(peak_power / median_power)
+        raw_snr = 20 * np.log10(peak_power / median_power)
+        n_bins = len(magnitudes)
+        noise_baseline = 10 * np.log10(np.log2(n_bins)) if n_bins > 1 else 0
+        snr_db = raw_snr - noise_baseline
     else:
         snr_db = 0.0
 
     return magnitudes, int(peak_bin), float(snr_db)
 
 
-def detect_preamble(samples, params, min_chirps=4, snr_threshold=15.0):
+def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
     """Scan samples for a LoRa preamble (repeated up-chirps).
 
     Uses overlapping windows to handle arbitrary chirp alignment.
@@ -196,7 +202,9 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=15.0):
             peak_power = spectrum[peak_bin]
             median_power = np.median(spectrum)
             if median_power > 0:
-                snr_db = float(20 * np.log10(peak_power / median_power))
+                raw_snr = 20 * np.log10(peak_power / median_power)
+                noise_baseline = 10 * np.log10(np.log2(len(spectrum)))
+                snr_db = float(raw_snr - noise_baseline)
             else:
                 snr_db = 0.0
             windows.append({

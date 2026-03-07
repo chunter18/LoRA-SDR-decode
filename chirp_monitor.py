@@ -53,7 +53,7 @@ def main():
     parser.add_argument('--freq', default=DEFAULT_FREQ, help='Center frequency (default: 915M)')
     parser.add_argument('--sf', default='7-12', help='Spreading factor or range (default: 7-12)')
     parser.add_argument('--bw', type=float, default=125e3, help='LoRa bandwidth in Hz (default: 125000)')
-    parser.add_argument('--threshold', type=float, default=15.0, help='SNR threshold in dB (default: 15.0)')
+    parser.add_argument('--threshold', type=float, default=5.0, help='SNR threshold in dB (default: 5.0)')
     parser.add_argument('--debug', action='store_true', help='Print per-block peak SNR for diagnostics')
     args = parser.parse_args()
 
@@ -124,7 +124,12 @@ def main():
                             spec = np.abs(np.fft.fft(w * ref_conj))
                             pk = int(np.argmax(spec))
                             med = np.median(spec)
-                            snr = float(20 * np.log10(spec[pk] / med)) if med > 0 else 0
+                            if med > 0:
+                                raw = 20 * np.log10(spec[pk] / med)
+                                nb = 10 * np.log10(np.log2(len(spec)))
+                                snr = float(raw - nb)
+                            else:
+                                snr = 0
                             wins.append(f"{snr:5.1f}@{pk}")
                             off += sym_len
                         print(
