@@ -17,6 +17,7 @@ import numpy as np
 
 from sdr_source import start_sdr, read_iq_blocks, DEFAULT_FREQ, DEFAULT_SAMPLE_RATE, DEFAULT_BANDWIDTH
 from chirp_detect import LoraParams, detect_preamble, generate_chirp, dechirp_and_fft
+from chirp_demod import demodulate
 
 
 class Deduplicator:
@@ -54,6 +55,7 @@ def main():
     parser.add_argument('--sf', default='7-12', help='Spreading factor or range (default: 7-12)')
     parser.add_argument('--bw', type=float, default=125e3, help='LoRa bandwidth in Hz (default: 125000)')
     parser.add_argument('--threshold', type=float, default=5.0, help='SNR threshold in dB (default: 5.0)')
+    parser.add_argument('--demod', action='store_true', help='Extract raw symbols after preamble detection')
     parser.add_argument('--debug', action='store_true', help='Print per-block peak SNR for diagnostics')
     args = parser.parse_args()
 
@@ -74,8 +76,9 @@ def main():
 
     # Use the largest symbol size for block reading
     max_sym_samples = max(p.symbol_samples for p in params_list)
-    # Read blocks large enough for at least 10 symbols of the largest SF
-    block_size = max_sym_samples * 10
+    # With --demod, need room for preamble (8) + sync (2) + SFD (2.25) + data (~20)
+    n_symbols_per_block = 35 if args.demod else 10
+    block_size = max_sym_samples * n_symbols_per_block
 
     print(f"LoRa Chirp Monitor")
     print(f"  Frequency: {args.freq}")
@@ -138,28 +141,50 @@ def main():
                             file=sys.stderr,
                         )
 
-                detections = detect_preamble(
-                    samples, params,
-                    min_chirps=6,
-                    snr_threshold=args.threshold,
-                )
-
-                for d in detections:
-                    # Suppress window: preamble + block duration (a preamble
-                    # spanning two blocks produces two detections)
-                    suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
-                    if not dedup.should_report(params.sf, elapsed, suppress_dur):
-                        continue
-                    detection_count += 1
-                    print(
-                        f"[{elapsed:8.1f}s] "
-                        f"LoRa preamble detected: "
-                        f"SF={params.sf}, "
-                        f"chirps={d['n_chirps']}, "
-                        f"SNR={d['snr_db']:.1f} dB, "
-                        f"bin={d['peak_bin']}, "
-                        f"noise={noise_dbfs:.1f} dBFS"
+                if args.demod:
+                    results = demodulate(
+                        samples, params,
+                        n_data_symbols=20,
+                        min_chirps=6,
+                        snr_threshold=args.threshold,
                     )
+                    for r in results:
+                        suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
+                        if not dedup.should_report(params.sf, elapsed, suppress_dur):
+                            continue
+                        detection_count += 1
+                        syms = r['symbols']
+                        print(
+                            f"[{elapsed:8.1f}s] "
+                            f"SF={params.sf}, "
+                            f"chirps={r['n_chirps']}, "
+                            f"SNR={r['snr_db']:.1f} dB, "
+                            f"noise={noise_dbfs:.1f} dBFS, "
+                            f"{len(syms)} symbols: {syms}"
+                        )
+                else:
+                    detections = detect_preamble(
+                        samples, params,
+                        min_chirps=6,
+                        snr_threshold=args.threshold,
+                    )
+
+                    for d in detections:
+                        # Suppress window: preamble + block duration (a preamble
+                        # spanning two blocks produces two detections)
+                        suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
+                        if not dedup.should_report(params.sf, elapsed, suppress_dur):
+                            continue
+                        detection_count += 1
+                        print(
+                            f"[{elapsed:8.1f}s] "
+                            f"LoRa preamble detected: "
+                            f"SF={params.sf}, "
+                            f"chirps={d['n_chirps']}, "
+                            f"SNR={d['snr_db']:.1f} dB, "
+                            f"bin={d['peak_bin']}, "
+                            f"noise={noise_dbfs:.1f} dBFS"
+                        )
 
             # Periodic status
             if block_count % 50 == 0:
