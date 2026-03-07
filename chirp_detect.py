@@ -1,0 +1,243 @@
+"""
+LoRa Chirp Detector — de-chirp + FFT approach for preamble detection.
+
+LoRa uses Chirp Spread Spectrum (CSS). Each symbol is a frequency chirp
+sweeping across the bandwidth. Data is encoded in the chirp's starting
+frequency. The preamble is 8+ identical unmodulated up-chirps.
+
+Detection approach:
+  1. Generate a reference down-chirp (conjugate of up-chirp)
+  2. Multiply received signal by reference (de-chirping)
+  3. FFT the result — a chirp collapses to a single peak
+  4. Look for repeated peaks at consistent intervals (preamble)
+"""
+
+from dataclasses import dataclass
+import numpy as np
+
+
+@dataclass
+class LoraParams:
+    """LoRa modulation parameters."""
+    sf: int = 12              # spreading factor (7-12)
+    bw: float = 125e3         # bandwidth in Hz
+    sample_rate: float = 1e6  # SDR sample rate in Hz
+
+    @property
+    def n_chips(self):
+        """Number of chips per symbol (2^SF)."""
+        return 1 << self.sf
+
+    @property
+    def symbol_duration(self):
+        """Duration of one symbol in seconds."""
+        return self.n_chips / self.bw
+
+    @property
+    def symbol_samples(self):
+        """Number of IQ samples per symbol."""
+        return int(self.symbol_duration * self.sample_rate)
+
+
+def generate_chirp(params, direction='up'):
+    """Generate a reference chirp signal.
+
+    Args:
+        params: LoraParams with sf, bw, sample_rate.
+        direction: 'up' for up-chirp, 'down' for down-chirp.
+
+    Returns:
+        Complex64 numpy array of one symbol duration.
+    """
+    n_samples = params.symbol_samples
+    t = np.arange(n_samples, dtype=np.float64) / params.sample_rate
+
+    T = params.symbol_duration
+    f0 = -params.bw / 2  # start frequency
+    chirp_rate = params.bw / T  # Hz per second
+
+    if direction == 'down':
+        f0 = params.bw / 2
+        chirp_rate = -chirp_rate
+
+    # Instantaneous phase: integral of frequency
+    # freq(t) = f0 + chirp_rate * t
+    # phase(t) = 2*pi * (f0*t + chirp_rate/2 * t^2)
+    phase = 2 * np.pi * (f0 * t + chirp_rate / 2 * t ** 2)
+    return np.exp(1j * phase).astype(np.complex64)
+
+
+def dechirp(samples, ref_chirp):
+    """De-chirp by multiplying samples with conjugate of reference chirp.
+
+    Args:
+        samples: Complex IQ samples (at least len(ref_chirp) long).
+        ref_chirp: Reference chirp from generate_chirp().
+
+    Returns:
+        De-chirped complex samples (same length as ref_chirp).
+    """
+    n = len(ref_chirp)
+    return samples[:n] * np.conj(ref_chirp)
+
+
+def dechirp_and_fft(samples, ref_chirp, n_fft=None):
+    """De-chirp samples and compute FFT to extract symbol value.
+
+    Args:
+        samples: Complex IQ samples.
+        ref_chirp: Reference chirp.
+        n_fft: FFT size (defaults to len(ref_chirp)).
+
+    Returns:
+        Tuple of (fft_magnitudes, peak_bin, peak_snr_db).
+        peak_bin is the symbol value (0 to N-1).
+        peak_snr_db is the peak power relative to the median bin.
+    """
+    if n_fft is None:
+        n_fft = len(ref_chirp)
+
+    dc = dechirp(samples, ref_chirp)
+    spectrum = np.fft.fft(dc, n=n_fft)
+    magnitudes = np.abs(spectrum)
+
+    peak_bin = np.argmax(magnitudes)
+    peak_power = magnitudes[peak_bin]
+
+    # SNR: peak power vs median (noise floor estimate)
+    median_power = np.median(magnitudes)
+    if median_power > 0:
+        snr_db = 20 * np.log10(peak_power / median_power)
+    else:
+        snr_db = 0.0
+
+    return magnitudes, int(peak_bin), float(snr_db)
+
+
+def detect_preamble(samples, params, min_chirps=4, snr_threshold=15.0):
+    """Scan samples for a LoRa preamble (repeated up-chirps).
+
+    Uses overlapping windows to handle arbitrary chirp alignment.
+    Looks for consecutive symbol-spaced windows with high de-chirp SNR
+    (indicating chirp energy is present, regardless of exact peak bin).
+
+    Args:
+        samples: Complex IQ samples to scan.
+        params: LoraParams.
+        min_chirps: Minimum consecutive high-SNR windows to count as preamble.
+        snr_threshold: Minimum SNR in dB for a window to count as a chirp.
+
+    Returns:
+        List of detection dicts, each with:
+          - 'sample_offset': sample index where preamble starts
+          - 'n_chirps': number of consecutive chirps detected
+          - 'snr_db': average SNR across detected chirps
+          - 'peak_bin': median bin across detected chirps
+    """
+    ref_up = generate_chirp(params, direction='up')
+    sym_len = params.symbol_samples
+    step = sym_len // 4  # 75% overlap for alignment tolerance
+    n_total = len(samples)
+
+    if n_total < sym_len * min_chirps:
+        return []
+
+    # Pre-conjugate reference for de-chirping
+    ref_conj = np.conj(ref_up)
+
+    # Try multiple starting offsets (quarter-symbol steps)
+    best_detection = None
+
+    for start in range(0, sym_len, step):
+        # From this starting offset, de-chirp at symbol intervals
+        windows = []
+        offset = start
+        while offset + sym_len <= n_total:
+            window = samples[offset:offset + sym_len]
+            spectrum = np.abs(np.fft.fft(window * ref_conj))
+            peak_bin = int(np.argmax(spectrum))
+            peak_power = spectrum[peak_bin]
+            median_power = np.median(spectrum)
+            if median_power > 0:
+                snr_db = float(20 * np.log10(peak_power / median_power))
+            else:
+                snr_db = 0.0
+            windows.append({
+                'bin': peak_bin,
+                'snr': snr_db,
+                'offset': offset,
+            })
+            offset += sym_len
+
+        # Find runs of consecutive high-SNR windows
+        detections = _find_snr_runs(windows, min_chirps, snr_threshold)
+
+        for d in detections:
+            if best_detection is None or d['snr_db'] > best_detection['snr_db']:
+                best_detection = d
+
+    return [best_detection] if best_detection else []
+
+
+def _find_snr_runs(windows, min_chirps, snr_threshold):
+    """Find runs of consecutive windows above SNR threshold."""
+    detections = []
+    run_start = None
+    run_snrs = []
+    run_bins = []
+
+    for i, w in enumerate(windows):
+        if w['snr'] >= snr_threshold:
+            if run_start is None:
+                run_start = i
+                run_snrs = []
+                run_bins = []
+            run_snrs.append(w['snr'])
+            run_bins.append(w['bin'])
+        else:
+            if run_start is not None and len(run_snrs) >= min_chirps:
+                detections.append({
+                    'sample_offset': windows[run_start]['offset'],
+                    'n_chirps': len(run_snrs),
+                    'snr_db': float(np.mean(run_snrs)),
+                    'peak_bin': int(np.median(run_bins)),
+                })
+            run_start = None
+            run_snrs = []
+            run_bins = []
+
+    # Check final run
+    if run_start is not None and len(run_snrs) >= min_chirps:
+        detections.append({
+            'sample_offset': windows[run_start]['offset'],
+            'n_chirps': len(run_snrs),
+            'snr_db': float(np.mean(run_snrs)),
+            'peak_bin': int(np.median(run_bins)),
+        })
+
+    return detections
+
+
+def generate_lora_preamble(params, n_chirps=8, payload_symbols=None):
+    """Generate a synthetic LoRa preamble (for testing).
+
+    Args:
+        params: LoraParams.
+        n_chirps: Number of preamble chirps.
+        payload_symbols: Optional list of symbol values to append after preamble.
+
+    Returns:
+        Complex64 numpy array of the full signal.
+    """
+    up = generate_chirp(params, direction='up')
+    signal = np.tile(up, n_chirps)
+
+    if payload_symbols:
+        sym_len = params.symbol_samples
+        for sym_val in payload_symbols:
+            # Cyclic-shift the up-chirp by sym_val positions
+            shift = int(sym_val * sym_len / params.n_chips)
+            shifted = np.roll(up, -shift)
+            signal = np.concatenate([signal, shifted])
+
+    return signal
