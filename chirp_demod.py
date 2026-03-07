@@ -47,3 +47,49 @@ def generate_lora_frame(params, n_preamble=8, sync_word=None, payload_symbols=No
         parts.append(np.roll(up, -shift))
 
     return np.concatenate(parts).astype(np.complex64)
+
+
+def find_sfd(samples, params, preamble_end):
+    """Find the SFD (down-chirps) after a detected preamble.
+
+    Scans forward from preamble_end looking for down-chirp energy.
+    Returns the sample offset where data symbols begin (after the 2.25 SFD).
+
+    Args:
+        samples: Complex IQ samples.
+        params: LoraParams.
+        preamble_end: Sample offset of preamble end.
+
+    Returns:
+        Sample offset of the first data symbol.
+    """
+    ref_up_conj = np.conj(generate_chirp(params, direction='up'))
+    ref_down_conj = np.conj(generate_chirp(params, direction='down'))
+    sym_len = params.symbol_samples
+
+    # Scan from preamble_end in quarter-symbol steps.
+    # Expect: 2 sync up-chirps, then 2+ down-chirps.
+    search_end = min(preamble_end + 6 * sym_len, len(samples) - sym_len)
+
+    first_down = None
+    offset = preamble_end
+    while offset + sym_len <= search_end:
+        window = samples[offset:offset + sym_len]
+        up_peak = np.max(np.abs(np.fft.fft(window * ref_up_conj)))
+        down_peak = np.max(np.abs(np.fft.fft(window * ref_down_conj)))
+
+        if down_peak > up_peak:
+            if first_down is None:
+                first_down = offset
+        elif first_down is not None:
+            # Transitioned out of down-chirp region
+            break
+
+        offset += sym_len // 4
+
+    if first_down is None:
+        # Fallback: assume standard 2 sync + 2.25 SFD
+        return preamble_end + int(4.25 * sym_len)
+
+    # Data starts 2.25 down-chirp durations after the first down-chirp
+    return first_down + int(2.25 * sym_len)
