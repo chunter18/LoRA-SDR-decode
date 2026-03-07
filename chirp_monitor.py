@@ -19,6 +19,35 @@ from sdr_source import start_sdr, read_iq_blocks, DEFAULT_FREQ, DEFAULT_SAMPLE_R
 from chirp_detect import LoraParams, detect_preamble, generate_chirp, dechirp_and_fft
 
 
+class Deduplicator:
+    """Suppress duplicate detections within one preamble duration per SF."""
+
+    def __init__(self):
+        self._last_time = {}  # sf -> timestamp
+
+    def should_report(self, sf, timestamp, preamble_duration):
+        last = self._last_time.get(sf)
+        if last is not None and (timestamp - last) < preamble_duration:
+            return False
+        self._last_time[sf] = timestamp
+        return True
+
+
+def estimate_noise_floor_dbfs(samples):
+    """Estimate noise floor as mean power in dBFS.
+
+    Args:
+        samples: Complex IQ samples.
+
+    Returns:
+        Noise floor in dBFS (float).
+    """
+    mean_power = np.mean(np.abs(samples) ** 2)
+    if mean_power > 0:
+        return float(10 * np.log10(mean_power))
+    return -np.inf
+
+
 def main():
     parser = argparse.ArgumentParser(description='LoRa chirp detector')
     parser.add_argument('--freq', default=DEFAULT_FREQ, help='Center frequency (default: 915M)')
@@ -69,11 +98,17 @@ def main():
     detection_count = 0
     block_count = 0
     start_time = time.time()
+    dedup = Deduplicator()
 
     try:
         for samples in read_iq_blocks(proc, block_size=block_size):
             block_count += 1
             elapsed = time.time() - start_time
+
+            # Noise floor estimate
+            noise_dbfs = estimate_noise_floor_dbfs(samples)
+            if args.debug:
+                print(f"[{elapsed:8.1f}s] noise floor: {noise_dbfs:.1f} dBFS", file=sys.stderr)
 
             for params in params_list:
                 # Debug: show per-window de-chirp results
@@ -106,6 +141,11 @@ def main():
                 )
 
                 for d in detections:
+                    # Suppress window: preamble + block duration (a preamble
+                    # spanning two blocks produces two detections)
+                    suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
+                    if not dedup.should_report(params.sf, elapsed, suppress_dur):
+                        continue
                     detection_count += 1
                     print(
                         f"[{elapsed:8.1f}s] "
@@ -113,7 +153,8 @@ def main():
                         f"SF={params.sf}, "
                         f"chirps={d['n_chirps']}, "
                         f"SNR={d['snr_db']:.1f} dB, "
-                        f"bin={d['peak_bin']}"
+                        f"bin={d['peak_bin']}, "
+                        f"noise={noise_dbfs:.1f} dBFS"
                     )
 
             # Periodic status

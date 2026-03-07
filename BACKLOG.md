@@ -4,14 +4,15 @@
 - Preamble detection WORKS on live SF12 beacon (~19 dB SNR, 6-9 chirps per detection)
 - Beacon: RFM95W on Arduino, SF12/125kHz, "HELLO" every 3 seconds
 - SDR: Pluto via rtl_433 -w - (CS16 format, 1 MHz sample rate)
-- 26/26 tests passing
+- 35/35 tests passing
 
 ## Known Issues to Fix First
 
-### 1. Deduplicate detections
-Preambles spanning two blocks produce two detections ~0.7s apart.
-Fix: track last detection timestamp, suppress if within one preamble duration
-(~262ms for SF12). Do this in chirp_monitor.py, not chirp_detect.py.
+### ~~1. Deduplicate detections~~ DONE
+Preambles spanning two blocks produced two detections ~0.7s apart.
+Fixed: `Deduplicator` class in chirp_monitor.py suppresses detections within
+(preamble_duration + block_duration) of the last. Verified on live beacon:
+exactly one detection per 3s transmission.
 
 ### 2. Bin variance is high (~1000 bins spread)
 De-chirped peak bins wander by ~1000 across a single preamble. Likely causes:
