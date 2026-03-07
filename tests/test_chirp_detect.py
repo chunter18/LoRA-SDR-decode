@@ -11,7 +11,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from chirp_detect import (
     LoraParams, generate_chirp, dechirp, dechirp_and_fft,
-    detect_preamble, generate_lora_preamble,
+    detect_preamble, generate_lora_preamble, decimate_to_lora,
 )
 
 # Use SF7 for fast tests (128 chips vs 4096 for SF12)
@@ -189,6 +189,85 @@ class TestDetectPreamble:
         short = np.zeros(params.symbol_samples * 3, dtype=np.complex64)
         detections = detect_preamble(short, params, min_chirps=6)
         assert len(detections) == 0
+
+
+class TestDecimateToLora:
+    def test_output_length(self):
+        """Output length is input_length / decimation_factor."""
+        params = FAST_PARAMS  # 1 MHz, 125 kHz BW → factor 4
+        n_samples = params.symbol_samples * 4  # 4096 samples
+        samples = np.zeros(n_samples, dtype=np.complex64)
+        decimated, new_params = decimate_to_lora(samples, params)
+        assert len(decimated) == n_samples // 4
+
+    def test_new_params_sample_rate(self):
+        """Decimated params have target sample rate (2*BW)."""
+        params = FAST_PARAMS
+        samples = np.zeros(params.symbol_samples, dtype=np.complex64)
+        _, new_params = decimate_to_lora(samples, params)
+        assert new_params.sample_rate == 2 * params.bw
+        assert new_params.sf == params.sf
+        assert new_params.bw == params.bw
+
+    def test_no_decimation_when_rate_matches(self):
+        """No decimation when sample_rate <= 2*BW."""
+        params = LoraParams(sf=7, bw=125e3, sample_rate=250e3)
+        samples = np.ones(100, dtype=np.complex64)
+        decimated, new_params = decimate_to_lora(samples, params)
+        assert len(decimated) == 100
+        assert new_params.sample_rate == 250e3
+
+    def test_amplitude_preserved(self):
+        """Decimation preserves signal amplitude for in-band signal."""
+        params = FAST_PARAMS
+        chirp = generate_chirp(params, direction='up')
+        decimated, _ = decimate_to_lora(chirp, params)
+        # RMS amplitude should be close to 1.0 (chirp is unit magnitude)
+        rms = np.sqrt(np.mean(np.abs(decimated) ** 2))
+        assert 0.8 < rms < 1.2
+
+    def test_chirp_dechirps_cleanly_after_decimation(self):
+        """A chirp decimated to 2*BW still produces a clean FFT peak."""
+        params = FAST_PARAMS
+        chirp = generate_chirp(params, direction='up')
+        decimated, new_params = decimate_to_lora(chirp, params)
+
+        # Generate reference at decimated rate
+        ref = generate_chirp(new_params, direction='up')
+        _, peak_bin, snr_db = dechirp_and_fft(decimated, ref)
+
+        assert peak_bin == 0  # unmodulated chirp → bin 0
+        assert snr_db > 10
+
+    def test_preamble_detected_after_decimation(self):
+        """Full preamble detection works on decimated signal."""
+        params = FAST_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+
+        # Add moderate noise
+        rng = np.random.default_rng(77)
+        noise = 0.3 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+
+        # Decimate then detect
+        decimated, new_params = decimate_to_lora(noisy, params)
+        detections = detect_preamble(decimated, new_params,
+                                     min_chirps=6, snr_threshold=8.0)
+        assert len(detections) >= 1
+        assert detections[0]['n_chirps'] >= 6
+
+    def test_peak_bin_in_lora_range(self):
+        """After decimation, peak bin is within LoRa symbol range."""
+        params = FAST_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+        decimated, new_params = decimate_to_lora(signal, params)
+        detections = detect_preamble(decimated, new_params,
+                                     min_chirps=6, snr_threshold=10.0)
+        assert len(detections) >= 1
+        # At 2*BW sample rate, bins span 0..2*n_chips-1
+        # Unmodulated preamble should peak near bin 0
+        assert detections[0]['peak_bin'] < new_params.n_chips // 4
 
 
 class TestGeneratePreamble:

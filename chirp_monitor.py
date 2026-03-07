@@ -116,7 +116,6 @@ def main():
                     ref_conj = np.conj(generate_chirp(params, direction='up'))
                     sym_len = params.symbol_samples
                     step = sym_len // 4
-                    # For each starting offset, show symbol-spaced windows
                     for start in range(0, sym_len, step):
                         wins = []
                         off = start

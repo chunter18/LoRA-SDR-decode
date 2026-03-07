@@ -39,6 +39,43 @@ class LoraParams:
         return int(self.symbol_duration * self.sample_rate)
 
 
+def decimate_to_lora(samples, params, target_rate=None):
+    """Filter and decimate IQ to near-LoRa bandwidth for cleaner de-chirping.
+
+    Uses FFT-based brick-wall lowpass filter and downsampling.
+
+    Args:
+        samples: Complex IQ at params.sample_rate.
+        params: LoraParams (original sample rate).
+        target_rate: Target sample rate (default: 2 * bw).
+
+    Returns:
+        Tuple of (decimated_samples, decimated_params).
+    """
+    if target_rate is None:
+        target_rate = 2 * params.bw
+
+    factor = int(params.sample_rate / target_rate)
+    if factor <= 1:
+        return samples, params
+
+    n = len(samples)
+    n_out = n // factor
+    half = n_out // 2
+
+    # FFT-based decimation: keep only bins within ±target_rate/2
+    spectrum = np.fft.fft(samples)
+    truncated = np.empty(n_out, dtype=spectrum.dtype)
+    truncated[:half] = spectrum[:half]       # positive frequencies
+    truncated[half:] = spectrum[n - half:]   # negative frequencies
+
+    # IFFT at reduced length; scale by n_out/n to preserve amplitude
+    decimated = np.fft.ifft(truncated) * (n_out / n)
+
+    new_params = LoraParams(sf=params.sf, bw=params.bw, sample_rate=target_rate)
+    return decimated.astype(np.complex64), new_params
+
+
 def generate_chirp(params, direction='up'):
     """Generate a reference chirp signal.
 

@@ -19,11 +19,13 @@ De-chirped peak bins wander by ~1000 across a single preamble. Likely causes:
 - 8x oversampling (1 MHz sample rate vs 125 kHz BW) means only 4096 of 32768
   bins are in the LoRa band — small alignment errors move peak a lot
 - Crystal frequency offset (~60 kHz) between Pluto and RFM95W
-- Possible: need to decimate to LoRa bandwidth before de-chirp+FFT
 
-Consider: bandpass filter around the signal, then decimate to ~250 kHz before
-de-chirping. This would give 4096/(250k/125k) = cleaner bins and also make
-FFTs much faster (4096 bins instead of 32768 for SF12).
+`decimate_to_lora()` added to chirp_detect.py — FFT-based brick-wall filter +
+downsample to 2*BW (250 kHz). Tested and working on synthetic signals.
+NOT yet integrated into detection pipeline because the peak/median SNR metric
+gives ~6 dB lower values at 8192 bins vs 32768 bins (fewer noise bins to
+average over), causing detections to fall below threshold. Fix #3 (better SNR
+metric) should resolve this. Decimation will be used for symbol demodulation.
 
 ### 3. Noise floor SNR metric
 The median-based SNR gives ~11-12 dB on pure noise, which is a known property
