@@ -1,7 +1,8 @@
 """LoRa Symbol Demodulator — extract raw symbol values from IQ samples."""
 
 import numpy as np
-from chirp_detect import LoraParams, generate_chirp, dechirp_and_fft
+from chirp_detect import (LoraParams, generate_chirp, dechirp_and_fft,
+                          detect_preamble, decimate_to_lora)
 
 
 def generate_lora_frame(params, n_preamble=8, sync_word=None, payload_symbols=None):
@@ -122,3 +123,55 @@ def extract_symbols(samples, params, data_offset, n_symbols):
         symbols.append(symbol)
 
     return symbols
+
+
+def demodulate(samples, params, n_data_symbols=20, min_chirps=4, snr_threshold=5.0):
+    """Full demodulation pipeline: detect preamble, find SFD, extract symbols.
+
+    Decimates to 2*BW for cleaner demodulation, then runs the full chain.
+
+    Args:
+        samples: Complex IQ samples at params.sample_rate.
+        params: LoraParams.
+        n_data_symbols: Max number of data symbols to extract.
+        min_chirps: Minimum preamble chirps for detection.
+        snr_threshold: SNR threshold for preamble detection.
+
+    Returns:
+        List of result dicts, each with:
+          - 'symbols': list of raw symbol values
+          - 'preamble_offset': sample offset of preamble in decimated signal
+          - 'data_offset': sample offset of data region in decimated signal
+          - 'n_chirps': number of preamble chirps detected
+          - 'snr_db': average preamble SNR
+    """
+    dec_samples, dec_params = decimate_to_lora(samples, params)
+
+    detections = detect_preamble(dec_samples, dec_params,
+                                 min_chirps=min_chirps,
+                                 snr_threshold=snr_threshold)
+    results = []
+    sym_len = dec_params.symbol_samples
+
+    for det in detections:
+        preamble_start = det['sample_offset']
+        preamble_end = preamble_start + det['n_chirps'] * sym_len
+
+        data_offset = find_sfd(dec_samples, dec_params, preamble_end)
+
+        max_possible = (len(dec_samples) - data_offset) // sym_len
+        n_to_extract = min(n_data_symbols, max_possible)
+        if n_to_extract <= 0:
+            continue
+
+        symbols = extract_symbols(dec_samples, dec_params, data_offset,
+                                  n_to_extract)
+        results.append({
+            'symbols': symbols,
+            'preamble_offset': preamble_start,
+            'data_offset': data_offset,
+            'n_chirps': det['n_chirps'],
+            'snr_db': det['snr_db'],
+        })
+
+    return results

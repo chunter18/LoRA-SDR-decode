@@ -6,7 +6,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from chirp_detect import LoraParams, generate_chirp
-from chirp_demod import generate_lora_frame, find_sfd, extract_symbols
+from chirp_demod import generate_lora_frame, find_sfd, extract_symbols, demodulate
 
 # 250 kHz rate (decimated, 2x oversampling of 125 kHz BW)
 PARAMS = LoraParams(sf=7, bw=125e3, sample_rate=250e3)
@@ -124,3 +124,49 @@ class TestExtractSymbols:
         data_offset = int((8 + 2 + 2.25) * sym_len)
         symbols = extract_symbols(frame, params, data_offset, n_symbols=1)
         assert symbols == [max_sym]
+
+
+class TestDemodulate:
+    def test_full_pipeline_clean(self):
+        """demodulate() recovers known symbols from a clean frame at 2x rate."""
+        params = PARAMS
+        payload = [10, 20, 30, 40, 50]
+        frame = generate_lora_frame(params, n_preamble=8, sync_word=[0, 0],
+                                    payload_symbols=payload)
+        # demodulate expects to decimate, but PARAMS is already at 2*BW,
+        # so decimation factor=1 (passthrough).
+        results = demodulate(frame, params, n_data_symbols=5)
+        assert len(results) == 1
+        assert results[0]['symbols'] == payload
+
+    def test_full_pipeline_from_oversampled(self):
+        """demodulate() works when decimating from 1 MHz to 250 kHz."""
+        # Generate frame at 250 kHz (2x), then upsample to 1 MHz (8x)
+        params_250 = PARAMS
+        payload = [10, 20, 30]
+        frame_250 = generate_lora_frame(params_250, n_preamble=8,
+                                        sync_word=[0, 0],
+                                        payload_symbols=payload)
+        # Zero-pad spectrum to upsample 4x (250k -> 1M)
+        n = len(frame_250)
+        spectrum = np.fft.fft(frame_250)
+        n_up = n * 4
+        upsampled_spectrum = np.zeros(n_up, dtype=spectrum.dtype)
+        half = n // 2
+        upsampled_spectrum[:half] = spectrum[:half]
+        upsampled_spectrum[n_up - half:] = spectrum[half:]
+        frame_1m = (np.fft.ifft(upsampled_spectrum) * 4).astype(np.complex64)
+
+        params_1m = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
+        results = demodulate(frame_1m, params_1m, n_data_symbols=3)
+        assert len(results) == 1
+        assert results[0]['symbols'] == payload
+
+    def test_no_detection_on_noise(self):
+        """demodulate() returns empty list on pure noise."""
+        params = PARAMS
+        rng = np.random.default_rng(123)
+        noise = (rng.standard_normal(10000) +
+                 1j * rng.standard_normal(10000)).astype(np.complex64)
+        results = demodulate(noise, params)
+        assert results == []
