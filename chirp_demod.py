@@ -1,7 +1,7 @@
 """LoRa Symbol Demodulator — extract raw symbol values from IQ samples."""
 
 import numpy as np
-from chirp_detect import LoraParams, generate_chirp
+from chirp_detect import LoraParams, generate_chirp, dechirp_and_fft
 
 
 def generate_lora_frame(params, n_preamble=8, sync_word=None, payload_symbols=None):
@@ -93,3 +93,32 @@ def find_sfd(samples, params, preamble_end):
 
     # Data starts 2.25 down-chirp durations after the first down-chirp
     return first_down + int(2.25 * sym_len)
+
+
+def extract_symbols(samples, params, data_offset, n_symbols):
+    """Extract raw symbol values from the data region.
+
+    Args:
+        samples: Complex IQ samples.
+        params: LoraParams.
+        data_offset: Sample offset where data symbols begin.
+        n_symbols: Number of symbols to extract.
+
+    Returns:
+        List of integer symbol values (0 to 2^SF - 1).
+    """
+    ref_up = generate_chirp(params, direction='up')
+    sym_len = params.symbol_samples
+    symbols = []
+
+    for i in range(n_symbols):
+        start = data_offset + i * sym_len
+        end = start + sym_len
+        if end > len(samples):
+            break
+        window = samples[start:end]
+        _, peak_bin, _ = dechirp_and_fft(window, ref_up)
+        symbol = peak_bin % params.n_chips
+        symbols.append(symbol)
+
+    return symbols

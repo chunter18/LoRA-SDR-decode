@@ -6,7 +6,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from chirp_detect import LoraParams, generate_chirp
-from chirp_demod import generate_lora_frame, find_sfd
+from chirp_demod import generate_lora_frame, find_sfd, extract_symbols
 
 # 250 kHz rate (decimated, 2x oversampling of 125 kHz BW)
 PARAMS = LoraParams(sf=7, bw=125e3, sample_rate=250e3)
@@ -73,3 +73,54 @@ class TestFindSFD:
         data_offset = find_sfd(noisy, params, preamble_end)
         expected = int((8 + 2 + 2.25) * sym_len)
         assert abs(data_offset - expected) <= sym_len // 2
+
+
+class TestExtractSymbols:
+    def test_extract_known_symbols(self):
+        """Extract symbols from a clean frame with known payload."""
+        params = PARAMS
+        payload = [10, 20, 30, 40, 50]
+        frame = generate_lora_frame(params, n_preamble=8, sync_word=[0, 0],
+                                    payload_symbols=payload)
+        sym_len = params.symbol_samples
+        data_offset = int((8 + 2 + 2.25) * sym_len)
+        symbols = extract_symbols(frame, params, data_offset, n_symbols=5)
+        assert symbols == payload
+
+    def test_extract_with_noise(self):
+        """Extract symbols from a noisy frame."""
+        params = PARAMS
+        payload = [10, 20, 30, 40, 50]
+        frame = generate_lora_frame(params, n_preamble=8, sync_word=[0, 0],
+                                    payload_symbols=payload)
+        rng = np.random.default_rng(42)
+        noise = 0.3 * (rng.standard_normal(len(frame)) +
+                       1j * rng.standard_normal(len(frame)))
+        noisy = (frame + noise).astype(np.complex64)
+        sym_len = params.symbol_samples
+        data_offset = int((8 + 2 + 2.25) * sym_len)
+        symbols = extract_symbols(noisy, params, data_offset, n_symbols=5)
+        assert symbols == payload
+
+    def test_extract_zero_symbols(self):
+        """All-zero symbols return zeros."""
+        params = PARAMS
+        payload = [0, 0, 0]
+        frame = generate_lora_frame(params, n_preamble=8, sync_word=[0, 0],
+                                    payload_symbols=payload)
+        sym_len = params.symbol_samples
+        data_offset = int((8 + 2 + 2.25) * sym_len)
+        symbols = extract_symbols(frame, params, data_offset, n_symbols=3)
+        assert symbols == [0, 0, 0]
+
+    def test_extract_max_symbol(self):
+        """Maximum symbol value (n_chips - 1) is extracted correctly."""
+        params = PARAMS
+        max_sym = params.n_chips - 1  # 127 for SF7
+        payload = [max_sym]
+        frame = generate_lora_frame(params, n_preamble=8, sync_word=[0, 0],
+                                    payload_symbols=payload)
+        sym_len = params.symbol_samples
+        data_offset = int((8 + 2 + 2.25) * sym_len)
+        symbols = extract_symbols(frame, params, data_offset, n_symbols=1)
+        assert symbols == [max_sym]
