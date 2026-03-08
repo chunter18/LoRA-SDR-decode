@@ -16,21 +16,30 @@ import time
 import numpy as np
 
 from sdr_source import start_sdr, read_iq_blocks, DEFAULT_FREQ, DEFAULT_SAMPLE_RATE, DEFAULT_BANDWIDTH
-from chirp_detect import LoraParams, detect_preamble, generate_chirp, dechirp_and_fft
-from chirp_demod import demodulate
+from chirp_detect import LoraParams, detect_preamble_binmatch, generate_chirp, dechirp_and_fft
+
+try:
+    from chirp_demod import demodulate
+except ImportError:
+    demodulate = None
 
 
 class Deduplicator:
-    """Suppress duplicate detections within one preamble duration per SF."""
+    """Suppress duplicate detections of the same packet across overlapping windows.
 
-    def __init__(self):
-        self._last_time = {}  # sf -> timestamp
+    Uses absolute sample position in the IQ stream (not wall-clock time)
+    so deduplication is immune to SDR buffering and processing delays.
+    """
 
-    def should_report(self, sf, timestamp, preamble_duration):
-        last = self._last_time.get(sf)
-        if last is not None and (timestamp - last) < preamble_duration:
+    def __init__(self, min_gap_samples):
+        self._last_sample = {}  # sf -> absolute sample offset of last report
+        self.min_gap = min_gap_samples
+
+    def should_report(self, sf, abs_sample_offset):
+        last = self._last_sample.get(sf)
+        if last is not None and abs(abs_sample_offset - last) < self.min_gap:
             return False
-        self._last_time[sf] = timestamp
+        self._last_sample[sf] = abs_sample_offset
         return True
 
 
@@ -78,11 +87,14 @@ def main():
 
     # Use the largest symbol size for block reading
     max_sym_samples = max(p.symbol_samples for p in params_list)
-    # With --demod, need room for preamble (8) + sync (2) + SFD (2.25) + data (~20)
-    # For detection-only, 10 symbols of the largest SF gives enough preamble
-    # coverage while keeping latency reasonable (~328 ms for SF12)
-    n_symbols_per_block = 35 if args.demod else 10
-    block_size = max_sym_samples * n_symbols_per_block
+
+    # Sliding window: analyze window_size samples, advance by step_size.
+    # Window must hold a full packet (preamble + data ≈ 26 symbols).
+    # Step is how much new data we read each iteration.
+    window_syms = 35 if args.demod else 26
+    step_syms = 8  # advance 8 symbols (~262ms at SF12) per iteration
+    window_size = max_sym_samples * window_syms
+    step_size = max_sym_samples * step_syms
 
     print(f"LoRa Chirp Monitor")
     print(f"  Backend: {args.backend}")
@@ -90,7 +102,8 @@ def main():
     print(f"  Spreading factors: {sf_list}")
     print(f"  Bandwidth: {args.bw/1e3:.0f} kHz")
     print(f"  SNR threshold: {args.threshold:.1f} dB")
-    print(f"  Block size: {block_size} samples ({block_size/sample_rate*1e3:.1f} ms)")
+    print(f"  Window: {window_size} samples ({window_size/sample_rate*1e3:.0f} ms), "
+          f"step: {step_size} samples ({step_size/sample_rate*1e3:.0f} ms)")
     print()
 
     print("Launching SDR...")
@@ -107,12 +120,35 @@ def main():
     sf_counts = {}  # sf -> count
     block_count = 0
     start_time = time.time()
-    dedup = Deduplicator()
+    # Deduplicate by sample position; min gap = 1 full packet (~26 symbols)
+    dedup = Deduplicator(min_gap_samples=max_sym_samples * 26)
+
+    # Pre-allocated sliding window buffer
+    ring = np.empty(window_size, dtype=np.complex64)
+    ring_fill = 0  # how many valid samples in ring
+    total_samples_read = 0
 
     try:
-        for samples in read_iq_blocks(proc, block_size=block_size):
+        for chunk in read_iq_blocks(proc, block_size=step_size):
+            total_samples_read += len(chunk)
+            n = len(chunk)
+
+            if ring_fill < window_size:
+                # Still filling initial window
+                end = min(ring_fill + n, window_size)
+                ring[ring_fill:end] = chunk[:end - ring_fill]
+                ring_fill = end
+                if ring_fill < window_size:
+                    continue
+            else:
+                # Shift old data left, append new chunk at the end
+                ring[:window_size - n] = ring[n:]
+                ring[window_size - n:] = chunk
+
+            samples = ring
             block_count += 1
             elapsed = time.time() - start_time
+            window_start_sample = total_samples_read - window_size
 
             # Noise floor estimate
             noise_dbfs = estimate_noise_floor_dbfs(samples)
@@ -147,7 +183,7 @@ def main():
                             file=sys.stderr,
                         )
 
-                if args.demod:
+                if args.demod and demodulate is not None:
                     results = demodulate(
                         samples, params,
                         n_data_symbols=20,
@@ -155,8 +191,8 @@ def main():
                         snr_threshold=args.threshold,
                     )
                     for r in results:
-                        suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
-                        if not dedup.should_report(params.sf, elapsed, suppress_dur):
+                        abs_offset = window_start_sample + r.get('sample_offset', 0)
+                        if not dedup.should_report(params.sf, abs_offset):
                             continue
                         detection_count += 1
                         sf_counts[params.sf] = sf_counts.get(params.sf, 0) + 1
@@ -170,28 +206,40 @@ def main():
                             f"{len(syms)} symbols: {syms}"
                         )
                 else:
-                    detections = detect_preamble(
+                    detections = detect_preamble_binmatch(
                         samples, params,
-                        min_chirps=6,
+                        min_preamble=6,
                         snr_threshold=args.threshold,
-                        n_offsets=1 if len(params_list) > 1 else 2,
+                        n_offsets=2,
                     )
 
                     for d in detections:
-                        # Suppress window: preamble + block duration (a preamble
-                        # spanning two blocks produces two detections)
-                        suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
-                        if not dedup.should_report(params.sf, elapsed, suppress_dur):
+                        abs_offset = window_start_sample + d['sample_offset']
+                        if not dedup.should_report(params.sf, abs_offset):
                             continue
                         detection_count += 1
                         sf_counts[params.sf] = sf_counts.get(params.sf, 0) + 1
+
+                        # Convert peak bin to frequency offset
+                        n_fft = params.symbol_samples
+                        peak_bin = d['peak_bin']
+                        if peak_bin >= n_fft // 2:
+                            offset_hz = (peak_bin - n_fft) * sample_rate / n_fft
+                        else:
+                            offset_hz = peak_bin * sample_rate / n_fft
+                        center_hz = float(str(args.freq).replace('M', 'e6').replace('k', 'e3'))
+                        freq_mhz = (center_hz + offset_hz) / 1e6
+
+                        data_time = abs_offset / sample_rate
                         print(
-                            f"[{elapsed:8.1f}s] "
-                            f"LoRa preamble detected: "
+                            f"[{data_time:8.1f}s] "
+                            f"LoRa preamble: "
                             f"SF={params.sf}, "
-                            f"chirps={d['n_chirps']}, "
+                            f"freq={freq_mhz:.4f} MHz, "
+                            f"preamble={d['n_preamble']}, "
+                            f"total={d['n_total']} syms, "
                             f"SNR={d['snr_db']:.1f} dB, "
-                            f"bin={d['peak_bin']}, "
+                            f"drift={d['bin_drift']:.1f}, "
                             f"noise={noise_dbfs:.1f} dBFS"
                         )
 

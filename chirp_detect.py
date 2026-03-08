@@ -59,6 +59,9 @@ def decimate_to_lora(samples, params, target_rate=None):
     if factor <= 1:
         return samples, params
 
+    # Actual output rate may differ from target_rate due to integer division
+    actual_rate = params.sample_rate / factor
+
     n = len(samples)
     n_out = n // factor
     half = n_out // 2
@@ -72,7 +75,7 @@ def decimate_to_lora(samples, params, target_rate=None):
     # IFFT at reduced length; scale by n_out/n to preserve amplitude
     decimated = np.fft.ifft(truncated) * (n_out / n)
 
-    new_params = LoraParams(sf=params.sf, bw=params.bw, sample_rate=target_rate)
+    new_params = LoraParams(sf=params.sf, bw=params.bw, sample_rate=actual_rate)
     return decimated.astype(np.complex64), new_params
 
 
@@ -272,6 +275,178 @@ def _find_snr_runs(windows, min_chirps, snr_threshold):
         })
 
     return detections
+
+
+def detect_preamble_binmatch(samples, params, min_preamble=6,
+                             snr_threshold=10.0, max_bin_drift_std=50,
+                             n_offsets=4):
+    """Detect LoRa preamble using dechirp+FFT with drift-tolerant bin matching.
+
+    Robust to TX/RX clock mismatch (bandwidth offset up to ~1%).
+
+    Approach:
+      1. Dechirp+FFT every symbol-length window at multiple starting offsets
+      2. Find runs of consecutive high-SNR windows (signal present)
+      3. Within each run, find the preamble portion: consecutive bins that
+         follow a LINEAR trend (constant drift from clock mismatch).
+         Data symbols have random bins, so they break the linear trend.
+      4. Deduplicate overlapping detections across offsets (keep best SNR).
+
+    The clock mismatch between TX and RX causes the dechirp bin to drift
+    linearly across preamble symbols. For preamble, consecutive bin diffs
+    are nearly constant (e.g., -25 +/- 8). For data, bin diffs are random
+    across the full range (0 to 2^SF). The std of bin diffs cleanly
+    separates preamble from data.
+
+    Args:
+        samples: Complex IQ samples to scan.
+        params: LoraParams.
+        min_preamble: Minimum preamble symbols to trigger detection.
+        snr_threshold: Minimum dechirp SNR (dB) for signal-present.
+        max_bin_drift_std: Maximum std of consecutive bin diffs to count
+            as preamble (accounts for clock mismatch). Default 50 is
+            generous enough for +/-1% BW offset.
+        n_offsets: Number of starting offsets to try (1=fast, 4=default).
+            Each offset is sym_len/n_offsets apart, ensuring at least one
+            offset aligns well with any packet's chirp boundaries.
+
+    Returns:
+        List of detection dicts, each with:
+          - 'sample_offset': sample index where preamble starts
+          - 'n_preamble': number of preamble symbols detected
+          - 'n_total': total signal symbols in the burst
+          - 'snr_db': average SNR across preamble
+          - 'peak_bin': median bin of preamble symbols
+          - 'bin_drift': bin change per symbol (proportional to BW mismatch)
+    """
+    ref_up = generate_chirp(params, direction='up')
+    sym_len = params.symbol_samples
+    n_total = len(samples)
+
+    if n_total < sym_len * min_preamble:
+        return []
+
+    ref_conj = np.conj(ref_up)
+    noise_baseline = 10 * np.log10(np.log2(sym_len)) if sym_len > 1 else 0
+    step = sym_len // n_offsets
+
+    all_detections = []
+
+    for start in range(0, sym_len, step):
+        n_windows = (n_total - start) // sym_len
+        if n_windows < min_preamble:
+            continue
+
+        end = start + n_windows * sym_len
+        windowed = samples[start:end].reshape(n_windows, sym_len)
+        dechirped = windowed * ref_conj[np.newaxis, :]
+        spectra = np.abs(np.fft.fft(dechirped, axis=1))
+
+        peak_bins = np.argmax(spectra, axis=1)
+        peak_powers = spectra[np.arange(n_windows), peak_bins]
+        median_powers = np.median(spectra, axis=1)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            snrs = np.where(
+                median_powers > 0,
+                20 * np.log10(peak_powers / median_powers) - noise_baseline,
+                0.0,
+            )
+
+        # Find runs of high-SNR windows and extract preamble from each
+        run_start = None
+        for i in range(n_windows + 1):
+            in_signal = i < n_windows and snrs[i] >= snr_threshold
+            if in_signal and run_start is None:
+                run_start = i
+            elif not in_signal and run_start is not None:
+                run_end = i
+                run_len = run_end - run_start
+
+                if run_len >= min_preamble:
+                    d = _extract_preamble(
+                        peak_bins[run_start:run_end],
+                        snrs[run_start:run_end],
+                        start + run_start * sym_len,
+                        sym_len, run_len, min_preamble, max_bin_drift_std,
+                    )
+                    if d is not None:
+                        all_detections.append(d)
+
+                run_start = None
+
+    # Deduplicate: detections within 1 symbol duration of each other
+    # are the same packet seen at different offsets — keep highest SNR.
+    return _deduplicate_detections(all_detections, sym_len)
+
+
+def _extract_preamble(run_bins, run_snrs, sample_offset, sym_len,
+                      run_len, min_preamble, max_bin_drift_std):
+    """Find the preamble portion within a high-SNR run using bin-diff consistency.
+
+    Returns a detection dict or None.
+    """
+    bins_f = run_bins.astype(float)
+    n_fft = sym_len
+
+    bin_diffs = np.diff(bins_f)
+    # Normalize diffs to [-N/2, N/2] for modular distance
+    bin_diffs = (bin_diffs + n_fft / 2) % n_fft - n_fft / 2
+
+    # Find the longest prefix where bin diffs are consistent
+    best_preamble_len = 0
+    best_drift = 0.0
+
+    for end_idx in range(min_preamble, run_len + 1):
+        diffs = bin_diffs[:end_idx - 1]
+        if len(diffs) < 2:
+            if end_idx >= min_preamble:
+                best_preamble_len = end_idx
+                best_drift = diffs[0] if len(diffs) > 0 else 0
+            continue
+        std = np.std(diffs)
+        if std <= max_bin_drift_std:
+            best_preamble_len = end_idx
+            best_drift = np.mean(diffs)
+        else:
+            break
+
+    if best_preamble_len >= min_preamble:
+        preamble_snrs = run_snrs[:best_preamble_len]
+        preamble_bins = bins_f[:best_preamble_len]
+        return {
+            'sample_offset': int(sample_offset),
+            'n_preamble': best_preamble_len,
+            'n_total': run_len,
+            'snr_db': float(np.mean(preamble_snrs)),
+            'peak_bin': int(np.median(preamble_bins)),
+            'bin_drift': float(best_drift),
+        }
+    return None
+
+
+def _deduplicate_detections(detections, sym_len):
+    """Remove duplicate detections of the same packet across offsets.
+
+    Detections within 1 symbol duration are considered the same packet.
+    Keeps the one with highest SNR (best window alignment).
+    """
+    if not detections:
+        return []
+
+    # Sort by sample_offset
+    detections.sort(key=lambda d: d['sample_offset'])
+
+    merged = [detections[0]]
+    for d in detections[1:]:
+        if d['sample_offset'] - merged[-1]['sample_offset'] < sym_len:
+            # Same packet — keep higher SNR
+            if d['snr_db'] > merged[-1]['snr_db']:
+                merged[-1] = d
+        else:
+            merged.append(d)
+
+    return merged
 
 
 def generate_lora_preamble(params, n_chirps=8, payload_symbols=None):

@@ -7,3 +7,9 @@ build/
 .pytest_cache/
 *.cs16
 *.cu8
+*.npy
+captures/
+ref_gr_lora/
+ref_gr_lora_sdr/
+docs/plans/
+live_test.npy

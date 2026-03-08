@@ -11,7 +11,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from chirp_detect import (
     LoraParams, generate_chirp, dechirp, dechirp_and_fft,
-    detect_preamble, generate_lora_preamble, decimate_to_lora,
+    detect_preamble, detect_preamble_binmatch,
+    generate_lora_preamble, decimate_to_lora,
 )
 
 # Use SF7 for fast tests (128 chips vs 4096 for SF12)
@@ -300,3 +301,154 @@ class TestGeneratePreamble:
         signal = generate_lora_preamble(params, n_chirps=8, payload_symbols=symbols)
         expected_len = (8 + len(symbols)) * params.symbol_samples
         assert len(signal) == expected_len
+
+
+class TestDetectPreambleBinmatch:
+    def test_clean_preamble(self):
+        """Detect a clean (noiseless) preamble."""
+        params = FAST_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+        detections = detect_preamble_binmatch(signal, params, min_preamble=6)
+
+        assert len(detections) >= 1
+        d = detections[0]
+        assert d['n_preamble'] >= 6
+        assert d['snr_db'] > 10
+
+    def test_preamble_with_noise(self):
+        """Detect a preamble buried in noise."""
+        params = FAST_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+
+        rng = np.random.default_rng(123)
+        noise = 0.3 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+
+        detections = detect_preamble_binmatch(noisy, params, min_preamble=6,
+                                              snr_threshold=8.0)
+        assert len(detections) >= 1
+        assert detections[0]['n_preamble'] >= 6
+
+    def test_no_false_detection_on_noise(self):
+        """Pure noise should not trigger a detection."""
+        params = FAST_PARAMS
+        rng = np.random.default_rng(456)
+        n_samples = params.symbol_samples * 20
+        noise = (rng.standard_normal(n_samples) +
+                 1j * rng.standard_normal(n_samples)).astype(np.complex64)
+
+        detections = detect_preamble_binmatch(noise, params, min_preamble=6,
+                                              snr_threshold=10.0)
+        assert len(detections) == 0
+
+    def test_too_short_signal(self):
+        """Signal shorter than min_preamble symbols returns empty."""
+        params = FAST_PARAMS
+        short = np.zeros(params.symbol_samples * 3, dtype=np.complex64)
+        detections = detect_preamble_binmatch(short, params, min_preamble=6)
+        assert len(detections) == 0
+
+    def test_preamble_with_frequency_offset(self):
+        """Detect a preamble that has a frequency offset (crystal error)."""
+        params = FAST_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+
+        # Apply 50 kHz frequency offset (typical crystal error)
+        t = np.arange(len(signal)) / params.sample_rate
+        offset_hz = 50e3
+        shifted = signal * np.exp(1j * 2 * np.pi * offset_hz * t).astype(np.complex64)
+
+        detections = detect_preamble_binmatch(shifted, params, min_preamble=6)
+        assert len(detections) >= 1
+        assert detections[0]['n_preamble'] >= 6
+
+    def test_preamble_at_arbitrary_offset(self):
+        """Detect a preamble that starts at an arbitrary sample offset."""
+        params = FAST_PARAMS
+        preamble = generate_lora_preamble(params, n_chirps=8)
+
+        # Pad with noise before and after
+        rng = np.random.default_rng(88)
+        pad_before = 537  # arbitrary non-aligned offset
+        pad_after = 1000
+        before = 0.1 * (rng.standard_normal(pad_before) +
+                        1j * rng.standard_normal(pad_before)).astype(np.complex64)
+        after = 0.1 * (rng.standard_normal(pad_after) +
+                       1j * rng.standard_normal(pad_after)).astype(np.complex64)
+        signal = np.concatenate([before, preamble, after])
+
+        detections = detect_preamble_binmatch(signal, params, min_preamble=6)
+        assert len(detections) >= 1
+        # Check that detected offset is near the actual preamble start
+        detected_offset = detections[0]['sample_offset']
+        assert abs(detected_offset - pad_before) < 2 * params.symbol_samples
+
+    def test_sf12_detection(self):
+        """Detect works for SF12 too."""
+        params = SLOW_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+
+        rng = np.random.default_rng(99)
+        noise = 0.4 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+
+        detections = detect_preamble_binmatch(noisy, params, min_preamble=6)
+        assert len(detections) >= 1
+
+    def test_returns_expected_fields(self):
+        """Detection dict has the expected keys."""
+        params = FAST_PARAMS
+        signal = generate_lora_preamble(params, n_chirps=8)
+        detections = detect_preamble_binmatch(signal, params, min_preamble=6)
+
+        assert len(detections) >= 1
+        d = detections[0]
+        assert 'sample_offset' in d
+        assert 'n_preamble' in d
+        assert 'n_total' in d
+        assert 'snr_db' in d
+        assert 'peak_bin' in d
+        assert 'bin_drift' in d
+
+    def test_bw_mismatch_detection(self):
+        """Detect preamble when TX and RX have different bandwidth (clock drift).
+
+        Simulates the real-world scenario where RFM95W BW is ~124.2 kHz
+        but we generate reference at 125 kHz.
+        """
+        # Generate signal at slightly different BW (simulating TX)
+        tx_params = LoraParams(sf=7, bw=124.2e3, sample_rate=1e6)
+        signal = generate_lora_preamble(tx_params, n_chirps=8)
+
+        # Detect using nominal BW (simulating RX)
+        rx_params = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
+        detections = detect_preamble_binmatch(signal, rx_params, min_preamble=6)
+
+        assert len(detections) >= 1
+        d = detections[0]
+        assert d['n_preamble'] >= 6
+        # bin_drift should be nonzero (reflecting the BW mismatch)
+        assert d['bin_drift'] != 0
+
+    def test_multiple_packets(self):
+        """Detect multiple separate preambles in a long capture."""
+        params = FAST_PARAMS
+        rng = np.random.default_rng(42)
+
+        # Build: noise + preamble1 + noise + preamble2 + noise
+        gap = params.symbol_samples * 10  # 10 symbols of noise between packets
+        preamble = generate_lora_preamble(params, n_chirps=8,
+                                          payload_symbols=[10, 20, 30])
+        noise1 = 0.1 * (rng.standard_normal(gap) +
+                        1j * rng.standard_normal(gap)).astype(np.complex64)
+        noise2 = 0.1 * (rng.standard_normal(gap) +
+                        1j * rng.standard_normal(gap)).astype(np.complex64)
+        noise3 = 0.1 * (rng.standard_normal(gap) +
+                        1j * rng.standard_normal(gap)).astype(np.complex64)
+
+        signal = np.concatenate([noise1, preamble, noise2, preamble, noise3])
+
+        detections = detect_preamble_binmatch(signal, params, min_preamble=6)
+        assert len(detections) == 2
