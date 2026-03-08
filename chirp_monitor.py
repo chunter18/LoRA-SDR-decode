@@ -1,13 +1,13 @@
 """
 LoRa Chirp Monitor — CLI tool that detects LoRa preambles from live SDR input.
 
-Launches rtl_433 to stream IQ from the Pluto SDR, runs chirp detection,
-and prints detections to stdout. No GUI.
+Streams IQ from the Pluto SDR, runs chirp detection, and prints detections
+to stdout. No GUI.
 
 Usage:
   python chirp_monitor.py
-  python chirp_monitor.py --sf 7       # detect SF7 only
-  python chirp_monitor.py --sf 7-12    # scan all spreading factors (default)
+  python chirp_monitor.py --sf 7            # detect SF7 only
+  python chirp_monitor.py --backend rtl_433  # use rtl_433 instead of rx_sdr
 """
 
 import sys
@@ -57,6 +57,8 @@ def main():
     parser.add_argument('--threshold', type=float, default=5.0, help='SNR threshold in dB (default: 5.0)')
     parser.add_argument('--demod', action='store_true', help='Extract raw symbols after preamble detection')
     parser.add_argument('--debug', action='store_true', help='Print per-block peak SNR for diagnostics')
+    parser.add_argument('--backend', default='rx_sdr', choices=['rx_sdr', 'rtl_433'],
+                        help='SDR backend (default: rx_sdr)')
     args = parser.parse_args()
 
     # Parse SF range
@@ -77,10 +79,12 @@ def main():
     # Use the largest symbol size for block reading
     max_sym_samples = max(p.symbol_samples for p in params_list)
     # With --demod, need room for preamble (8) + sync (2) + SFD (2.25) + data (~20)
-    n_symbols_per_block = 35 if args.demod else 10
+    # For detection-only, use large blocks to minimize per-block Python overhead
+    n_symbols_per_block = 35 if args.demod else 100
     block_size = max_sym_samples * n_symbols_per_block
 
     print(f"LoRa Chirp Monitor")
+    print(f"  Backend: {args.backend}")
     print(f"  Frequency: {args.freq}")
     print(f"  Spreading factors: {sf_list}")
     print(f"  Bandwidth: {args.bw/1e3:.0f} kHz")
@@ -90,7 +94,7 @@ def main():
 
     print("Launching SDR...")
     try:
-        proc = start_sdr(args.freq, sample_rate, DEFAULT_BANDWIDTH)
+        proc = start_sdr(args.freq, sample_rate, DEFAULT_BANDWIDTH, backend=args.backend)
     except RuntimeError as e:
         print(e)
         sys.exit(1)

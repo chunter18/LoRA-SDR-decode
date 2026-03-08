@@ -1,7 +1,11 @@
 """
-SDR IQ Source — reads raw IQ samples from rtl_433 via subprocess.
+SDR IQ Source — reads raw IQ samples from SDR via subprocess.
 
-rtl_433 streams CS16 (signed 16-bit interleaved I/Q) on stdout with -w -.
+Two backends available:
+  - rx_sdr: lightweight raw IQ streamer via SoapySDR (default, full-rate)
+  - rtl_433: protocol decoder with IQ passthrough (slower due to internal processing)
+
+Both stream CS16 (signed 16-bit interleaved I/Q) on stdout.
 This module launches the process and provides a generator for IQ blocks.
 """
 
@@ -11,6 +15,7 @@ import numpy as np
 
 # Default SDR settings
 RTL_433 = r"C:\Program Files\PothosSDR\bin\rtl_433-rtlsdr-soapysdr.exe"
+RX_SDR = r"C:\Program Files\PothosSDR\bin\rx_sdr.exe"
 DEFAULT_FREQ = "915M"
 DEFAULT_SAMPLE_RATE = 1000000
 DEFAULT_BANDWIDTH = 1000000
@@ -37,26 +42,42 @@ def parse_cs16(buf):
 
 
 def start_sdr(freq=DEFAULT_FREQ, sample_rate=DEFAULT_SAMPLE_RATE,
-              bandwidth=DEFAULT_BANDWIDTH):
-    """Launch rtl_433 as a subprocess streaming raw IQ to stdout.
+              bandwidth=DEFAULT_BANDWIDTH, backend='rx_sdr'):
+    """Launch an SDR subprocess streaming raw IQ to stdout.
 
     Args:
-        freq: Center frequency string (e.g. "915M").
+        freq: Center frequency string (e.g. "915M") or int in Hz.
         sample_rate: Sample rate in Hz.
         bandwidth: Analog bandwidth in Hz.
+        backend: 'rx_sdr' (default, fast) or 'rtl_433' (slower, has decoder).
 
     Returns:
         subprocess.Popen process handle. Read IQ from proc.stdout.
     """
-    cmd = [
-        RTL_433,
-        "-d", "driver=plutosdr",
-        "-f", freq,
-        "-s", str(sample_rate),
-        "-t", f"bandwidth={bandwidth}",
-        "-R", "0",
-        "-w", "-",
-    ]
+    freq_hz = str(int(float(str(freq).replace('M', 'e6').replace('k', 'e3'))))
+
+    if backend == 'rx_sdr':
+        cmd = [
+            RX_SDR,
+            "-d", "driver=plutosdr",
+            "-f", freq_hz,
+            "-s", str(int(sample_rate)),
+            "-F", "CS16",
+            "-b", str(int(sample_rate)),  # ~1 second output buffer
+            "-",
+        ]
+    elif backend == 'rtl_433':
+        cmd = [
+            RTL_433,
+            "-d", "driver=plutosdr",
+            "-f", str(freq),
+            "-s", str(sample_rate),
+            "-t", f"bandwidth={bandwidth}",
+            "-R", "0",
+            "-w", "-",
+        ]
+    else:
+        raise ValueError(f"Unknown backend: {backend!r} (use 'rx_sdr' or 'rtl_433')")
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -65,7 +86,7 @@ def start_sdr(freq=DEFAULT_FREQ, sample_rate=DEFAULT_SAMPLE_RATE,
         ret = proc.wait(timeout=2)
         stderr = proc.stderr.read().decode(errors='replace')
         raise RuntimeError(
-            f"rtl_433 exited with code {ret}\n{stderr[-500:]}"
+            f"{backend} exited with code {ret}\n{stderr[-500:]}"
         )
     except subprocess.TimeoutExpired:
         pass  # still running, good
@@ -74,7 +95,7 @@ def start_sdr(freq=DEFAULT_FREQ, sample_rate=DEFAULT_SAMPLE_RATE,
 
 
 def read_iq_blocks(proc, block_size=4096):
-    """Generator that yields complex64 IQ blocks from rtl_433 stdout.
+    """Generator that yields complex64 IQ blocks from SDR stdout.
 
     Args:
         proc: subprocess.Popen from start_sdr().
@@ -84,14 +105,18 @@ def read_iq_blocks(proc, block_size=4096):
         Complex64 numpy arrays of length block_size.
     """
     chunk_bytes = block_size * BYTES_PER_SAMPLE
-    buf = b''
 
     while True:
-        data = proc.stdout.read(65536)
+        data = proc.stdout.read(chunk_bytes)
         if not data:
             break
-        buf += data
-
-        while len(buf) >= chunk_bytes:
-            yield parse_cs16(buf[:chunk_bytes])
-            buf = buf[chunk_bytes:]
+        if len(data) < chunk_bytes:
+            # Short read — accumulate until we have a full block
+            buf = bytearray(data)
+            while len(buf) < chunk_bytes:
+                more = proc.stdout.read(chunk_bytes - len(buf))
+                if not more:
+                    return
+                buf.extend(more)
+            data = bytes(buf)
+        yield parse_cs16(data)

@@ -179,7 +179,7 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
     """
     ref_up = generate_chirp(params, direction='up')
     sym_len = params.symbol_samples
-    step = sym_len // 4  # 75% overlap for alignment tolerance
+    step = sym_len // 2  # 50% overlap for alignment tolerance
     n_total = len(samples)
 
     if n_total < sym_len * min_chirps:
@@ -188,31 +188,40 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
     # Pre-conjugate reference for de-chirping
     ref_conj = np.conj(ref_up)
 
-    # Try multiple starting offsets (quarter-symbol steps)
     best_detection = None
+    noise_baseline = 10 * np.log10(np.log2(sym_len)) if sym_len > 1 else 0
 
     for start in range(0, sym_len, step):
-        # From this starting offset, de-chirp at symbol intervals
-        windows = []
-        offset = start
-        while offset + sym_len <= n_total:
-            window = samples[offset:offset + sym_len]
-            spectrum = np.abs(np.fft.fft(window * ref_conj))
-            peak_bin = int(np.argmax(spectrum))
-            peak_power = spectrum[peak_bin]
-            median_power = np.median(spectrum)
-            if median_power > 0:
-                raw_snr = 20 * np.log10(peak_power / median_power)
-                noise_baseline = 10 * np.log10(np.log2(len(spectrum)))
-                snr_db = float(raw_snr - noise_baseline)
-            else:
-                snr_db = 0.0
-            windows.append({
-                'bin': peak_bin,
-                'snr': snr_db,
-                'offset': offset,
-            })
-            offset += sym_len
+        # Batch all windows into a 2D array for vectorized FFT
+        n_windows = (n_total - start) // sym_len
+        if n_windows < min_chirps:
+            continue
+
+        # Reshape signal into non-overlapping windows from this offset
+        end = start + n_windows * sym_len
+        windowed = samples[start:end].reshape(n_windows, sym_len)
+
+        # Batch dechirp + FFT (one call for all windows)
+        dechirped = windowed * ref_conj[np.newaxis, :]
+        spectra = np.abs(np.fft.fft(dechirped, axis=1))
+
+        # Vectorized peak finding and SNR
+        peak_bins = np.argmax(spectra, axis=1)
+        peak_powers = spectra[np.arange(n_windows), peak_bins]
+        median_powers = np.median(spectra, axis=1)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw_snrs = np.where(
+                median_powers > 0,
+                20 * np.log10(peak_powers / median_powers) - noise_baseline,
+                0.0,
+            )
+
+        offsets = start + np.arange(n_windows) * sym_len
+        windows = [
+            {'bin': int(peak_bins[i]), 'snr': float(raw_snrs[i]), 'offset': int(offsets[i])}
+            for i in range(n_windows)
+        ]
 
         # Find runs of consecutive high-SNR windows
         detections = _find_snr_runs(windows, min_chirps, snr_threshold)
