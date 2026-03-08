@@ -139,26 +139,14 @@ class TestDemodulate:
         assert len(results) == 1
         assert results[0]['symbols'] == payload
 
-    def test_full_pipeline_from_oversampled(self):
-        """demodulate() works when decimating from 1 MHz to 250 kHz."""
-        # Generate frame at 250 kHz (2x), then upsample to 1 MHz (8x)
-        params_250 = PARAMS
-        payload = [10, 20, 30]
-        frame_250 = generate_lora_frame(params_250, n_preamble=8,
-                                        sync_word=[0, 0],
-                                        payload_symbols=payload)
-        # Zero-pad spectrum to upsample 4x (250k -> 1M)
-        n = len(frame_250)
-        spectrum = np.fft.fft(frame_250)
-        n_up = n * 4
-        upsampled_spectrum = np.zeros(n_up, dtype=spectrum.dtype)
-        half = n // 2
-        upsampled_spectrum[:half] = spectrum[:half]
-        upsampled_spectrum[n_up - half:] = spectrum[half:]
-        frame_1m = (np.fft.ifft(upsampled_spectrum) * 4).astype(np.complex64)
-
+    def test_full_pipeline_at_higher_sample_rate(self):
+        """demodulate() works at 8x oversampling (1 MHz for 125 kHz BW)."""
         params_1m = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
-        results = demodulate(frame_1m, params_1m, n_data_symbols=3)
+        payload = [10, 20, 30]
+        frame = generate_lora_frame(params_1m, n_preamble=8,
+                                    sync_word=[0, 0],
+                                    payload_symbols=payload)
+        results = demodulate(frame, params_1m, n_data_symbols=3)
         assert len(results) == 1
         assert results[0]['symbols'] == payload
 

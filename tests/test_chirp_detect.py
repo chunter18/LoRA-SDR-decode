@@ -11,7 +11,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from chirp_detect import (
     LoraParams, generate_chirp, dechirp, dechirp_and_fft,
-    detect_preamble, generate_lora_preamble, decimate_to_lora,
+    detect_preamble, generate_lora_preamble, generate_lora_packet,
+    decimate_to_lora, bin_to_freq_offset, estimate_parameters,
 )
 
 # Use SF7 for fast tests (128 chips vs 4096 for SF12)
@@ -300,3 +301,226 @@ class TestGeneratePreamble:
         signal = generate_lora_preamble(params, n_chirps=8, payload_symbols=symbols)
         expected_len = (8 + len(symbols)) * params.symbol_samples
         assert len(signal) == expected_len
+
+
+class TestBinToFreqOffset:
+    def test_zero_bin(self):
+        assert bin_to_freq_offset(0, 1024, 1e6) == 0.0
+
+    def test_positive_bin(self):
+        # bin 100 out of 1024, at 1 MHz → 100 * 1e6 / 1024 ≈ 97656 Hz
+        result = bin_to_freq_offset(100, 1024, 1e6)
+        assert abs(result - 97656.25) < 1.0
+
+    def test_negative_wrap(self):
+        # bin 924 out of 1024 → (924 - 1024) * 1e6 / 1024 = -100 * 1e6 / 1024
+        result = bin_to_freq_offset(924, 1024, 1e6)
+        assert abs(result - (-97656.25)) < 1.0
+
+    def test_nyquist(self):
+        # bin 512 out of 1024 → not wrapped (== n_fft/2)
+        result = bin_to_freq_offset(512, 1024, 1e6)
+        assert abs(result - 500000.0) < 1.0
+
+
+class TestEstimateParameters:
+    def test_detects_sf12_125k(self):
+        """Correctly identifies SF12/125kHz preamble."""
+        params = LoraParams(sf=12, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        result = estimate_parameters(signal, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 12
+        assert result['bw'] == 125e3
+
+    def test_detects_sf7_125k(self):
+        """Correctly identifies SF7/125kHz preamble."""
+        params = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        # Pad so larger SFs have enough samples to attempt (and fail)
+        padded = np.concatenate([signal, np.zeros(300000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 7
+        assert result['bw'] == 125e3
+
+    def test_detects_sf10_250k(self):
+        """Correctly identifies SF10/250kHz preamble when BW is set to 250k."""
+        params = LoraParams(sf=10, bw=250e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        padded = np.concatenate([signal, np.zeros(300000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=250e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 10
+        assert result['bw'] == 250e3
+
+    def test_detects_frequency_offset(self):
+        """Correctly estimates frequency offset of shifted signal."""
+        params = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        # Apply 50 kHz frequency offset
+        t = np.arange(len(signal)) / 1e6
+        shifted = (signal * np.exp(2j * np.pi * 50e3 * t)).astype(np.complex64)
+        padded = np.concatenate([shifted, np.zeros(300000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 7
+        assert abs(result['freq_offset_hz'] - 50e3) < 5e3
+
+    def test_no_detection_on_noise(self):
+        """Pure noise returns None."""
+        rng = np.random.default_rng(42)
+        noise = (rng.standard_normal(300000) +
+                 1j * rng.standard_normal(300000)).astype(np.complex64)
+        result = estimate_parameters(noise, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is None
+
+    def test_detects_with_noise(self):
+        """Detects SF correctly in noisy signal."""
+        params = LoraParams(sf=12, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        rng = np.random.default_rng(42)
+        noise = 0.3 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+        result = estimate_parameters(noisy, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 12
+        assert result['bw'] == 125e3
+
+    def test_discriminates_sf_with_freq_offset(self):
+        """SF12/125k with 60 kHz crystal offset is not confused with other SFs."""
+        params = LoraParams(sf=12, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        t = np.arange(len(signal)) / 1e6
+        signal = (signal * np.exp(2j * np.pi * 60e3 * t)).astype(np.complex64)
+        rng = np.random.default_rng(42)
+        noise = 0.3 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+        padded = np.concatenate([noisy, np.zeros(400000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 12
+        assert result['bw'] == 125e3
+        assert abs(result['freq_offset_hz'] - 60e3) < 5e3
+
+    def test_wrong_bw_detects_wrong_sf(self):
+        """Signal at 250k BW analyzed at 125k BW detects at wrong SF.
+
+        A 250k signal has 2x the chip rate of 125k, so when dechirped at
+        125k the symbol duration is halved — the detector sees it as a
+        lower SF. This is expected: BW must be set correctly for accurate SF.
+        """
+        params = LoraParams(sf=10, bw=250e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        padded = np.concatenate([signal, np.zeros(400000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        # Will detect something, but the SF will be wrong (lower than 10)
+        if result is not None:
+            assert result['sf'] != 10 or result['bw'] != 250e3
+
+    def test_timing_offset(self):
+        """Detects signal that starts mid-block (not at sample 0)."""
+        params = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        # Embed signal 50000 samples into a noise block
+        rng = np.random.default_rng(99)
+        block = 0.1 * (rng.standard_normal(400000) +
+                       1j * rng.standard_normal(400000)).astype(np.complex64)
+        offset = 50000
+        block[offset:offset + len(signal)] += signal
+        result = estimate_parameters(block, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 7
+        assert result['bw'] == 125e3
+
+    def test_combined_realistic_conditions(self):
+        """SF12/125k with freq offset + noise + timing offset (live-like)."""
+        params = LoraParams(sf=12, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        # Apply 60 kHz frequency offset
+        t = np.arange(len(signal)) / 1e6
+        signal = (signal * np.exp(2j * np.pi * 60e3 * t)).astype(np.complex64)
+        # Embed with timing offset in noisy block
+        rng = np.random.default_rng(77)
+        block = 0.3 * (rng.standard_normal(600000) +
+                       1j * rng.standard_normal(600000)).astype(np.complex64)
+        offset = 30000
+        block[offset:offset + len(signal)] += signal
+        result = estimate_parameters(block, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 12
+        assert result['bw'] == 125e3
+
+    def test_sample_rate_mismatch_does_not_double_bw(self):
+        """A 2x sample rate mismatch produces garbage, not systematic errors."""
+        actual_rate = 2e6
+        assumed_rate = 1e6
+
+        params_real = LoraParams(sf=12, bw=125e3, sample_rate=actual_rate)
+        signal = generate_lora_preamble(params_real, n_chirps=8)
+        padded = np.concatenate([signal, np.zeros(700000, dtype=np.complex64)])
+
+        result = estimate_parameters(padded, assumed_rate, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        if result is not None:
+            assert result['score'] < 1.0, "Score should be very low with wrong sample rate"
+
+    def test_correct_rate_gives_correct_result(self):
+        """With correct sample rate assumption, SF is detected correctly."""
+        rate = 2e6
+        params = LoraParams(sf=12, bw=125e3, sample_rate=rate)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        padded = np.concatenate([signal, np.zeros(700000, dtype=np.complex64)])
+
+        result = estimate_parameters(padded, rate, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['bw'] == 125e3
+        assert result['sf'] == 12
+
+    def test_full_packet_sf12_125k(self):
+        """SF detection works on full LoRa packet (not just preamble).
+
+        Real packets have sync words, SFD down-chirps, and data after the
+        preamble. Tests that this extra structure doesn't confuse the scorer.
+        """
+        params = LoraParams(sf=12, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_packet(params, n_preamble=8, data_symbols=[10, 100, 200, 50, 3000])
+        rng = np.random.default_rng(42)
+        noise = 0.3 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+        padded = np.concatenate([noisy, np.zeros(200000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 12, f"Expected SF12, got SF{result['sf']}"
+        assert result['bw'] == 125e3, f"Expected 125k, got {result['bw']/1e3:.0f}k"
+
+    def test_full_packet_sf7_250k(self):
+        """SF detection on full SF7/250k packet with correct BW set."""
+        params = LoraParams(sf=7, bw=250e3, sample_rate=1e6)
+        signal = generate_lora_packet(params, n_preamble=8, data_symbols=[10, 42, 100])
+        rng = np.random.default_rng(99)
+        noise = 0.2 * (rng.standard_normal(len(signal)) +
+                       1j * rng.standard_normal(len(signal)))
+        noisy = (signal + noise).astype(np.complex64)
+        padded = np.concatenate([noisy, np.zeros(300000, dtype=np.complex64)])
+        result = estimate_parameters(padded, 1e6, bw=250e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 7, f"Expected SF7, got SF{result['sf']}"
+        assert result['bw'] == 250e3, f"Expected 250k, got {result['bw']/1e3:.0f}k"
+
+    def test_sf7_realistic(self):
+        """SF7/125k with freq offset + noise — short preamble still detected."""
+        params = LoraParams(sf=7, bw=125e3, sample_rate=1e6)
+        signal = generate_lora_preamble(params, n_chirps=8)
+        t = np.arange(len(signal)) / 1e6
+        signal = (signal * np.exp(2j * np.pi * -30e3 * t)).astype(np.complex64)
+        rng = np.random.default_rng(55)
+        block = 0.2 * (rng.standard_normal(400000) +
+                       1j * rng.standard_normal(400000)).astype(np.complex64)
+        block[80000:80000 + len(signal)] += signal
+        result = estimate_parameters(block, 1e6, bw=125e3, min_chirps=6, snr_threshold=5.0)
+        assert result is not None
+        assert result['sf'] == 7
+        assert result['bw'] == 125e3

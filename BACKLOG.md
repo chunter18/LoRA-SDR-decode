@@ -1,110 +1,100 @@
 # LoRa Chirp Detector — Backlog
 
-## Current Status
-- Preamble detection WORKS on live SF12 beacon (~19 dB SNR, 6-9 chirps per detection)
-- Symbol demodulation WORKS on synthetic signals (all SFs, with noise)
-- Beacon: RFM95W on Arduino, SF12/125kHz, "HELLO" every 3 seconds
-- SDR: Pluto via rtl_433 -w - (CS16 format, 1 MHz sample rate)
-- 55/55 tests passing
+## Current Status (2026-03-07)
 
-## Known Issues to Fix First
+### What works
+- **Preamble detection** — solid on live SF7/125k beacon (~10-12 dB SNR,
+  6-17 chirps). Single-SF mode at 0.52 MSPS (52% real-time at 1 MSPS).
+  46 tests passing in chirp_detect.
+- **Symbol demod** — works on synthetic signals (9/11 tests pass).
+  Full pipeline has constant +96 symbol offset from 0.25-symbol SFD
+  alignment issue. Live demod produces garbage due to frequency
+  offset / timing coupling at 8x oversampling.
+- **Waterfall display** — works for visual confirmation.
+- **Deduplication** — suppresses duplicate detections from preambles
+  spanning block boundaries.
 
-### ~~1. Deduplicate detections~~ DONE
-Preambles spanning two blocks produced two detections ~0.7s apart.
-Fixed: `Deduplicator` class in chirp_monitor.py suppresses detections within
-(preamble_duration + block_duration) of the last. Verified on live beacon:
-exactly one detection per 3s transmission.
+### What doesn't work
+- **SF scan mode** — too slow for real-time in Python. 6 SFs at fixed
+  125k BW gives ~0.07 MSPS (7% real-time). Giant blocks sized for SF12
+  create hundreds of noise windows for small SFs, producing false runs
+  with enormous bin_std. Score-based filtering helps but doesn't fix
+  the fundamental speed problem.
+- **BW auto-detection** — dropped. 18 combos was 5x slower than
+  real-time. The "BW doubling" we saw was actually other LoRa devices
+  in the ISM band, not a detection bug.
+- **Live symbol extraction** — frequency offset and timing alignment
+  are coupled at 8x oversampling. Quarter-symbol timing error shifts
+  dechirp peak by ~1000 bins.
 
-### 2. Bin variance is high (~1000 bins spread)
-De-chirped peak bins wander by ~1000 across a single preamble. Likely causes:
-- 8x oversampling (1 MHz sample rate vs 125 kHz BW) means only 4096 of 32768
-  bins are in the LoRa band — small alignment errors move peak a lot
-- Crystal frequency offset (~60 kHz) between Pluto and RFM95W
+### Test summary
+- chirp_detect: 46/46 pass
+- chirp_demod: 9/11 pass (2 full-pipeline failures from SFD offset)
+- chirp_monitor: 9/9 pass
+- sdr_source: 7/7 pass
+- Total: 71/73 pass
 
-`decimate_to_lora()` added to chirp_detect.py — FFT-based brick-wall filter +
-downsample to 2*BW (250 kHz). Tested and working on synthetic signals.
-NOT yet integrated into detection pipeline because the peak/median SNR metric
-gives ~6 dB lower values at 8192 bins vs 32768 bins (fewer noise bins to
-average over), causing detections to fall below threshold. Fix #3 (better SNR
-metric) should resolve this. Decimation will be used for symbol demodulation.
+## Hardware
+- Beacon: RFM95W on Arduino UNO, SF7-12 cycle or fixed SF12
+- SDR: ADALM-Pluto via rtl_433, CS16 format, 1 MSPS
+- Antenna: V-dipole, ~3.25" arms, 915 MHz tuned
 
-### ~~3. Noise floor SNR metric~~ DONE
-The old peak/median SNR gave ~11-12 dB on pure noise (max of N Rayleigh RVs
-exceeds median by ~sqrt(log2(N))). Fixed by subtracting the expected noise
-baseline: `corrected = raw - 10*log10(log2(N_bins))`. Now noise reads ~0 dB,
-signal ~7-8 dB, with default threshold lowered to 5.0 dB (~7 dB margin vs
-the old ~4 dB). Metric is consistent across FFT sizes (tested SF7 and SF12).
+## Architecture
 
-## Next Steps (in order)
-
-### ~~Step 1: Symbol Demodulation~~ DONE
-chirp_demod.py implements:
-- `generate_lora_frame()` — synthetic frame generator for testing
-- `find_sfd()` — locates SFD down-chirps via up/down energy comparison
-- `extract_symbols()` — dechirp + FFT per symbol, full FFT gives direct
-  bin-to-symbol mapping regardless of oversampling rate
-- `demodulate()` — full pipeline: decimate → detect → find_sfd → extract
-
-chirp_monitor.py `--demod` flag enables live symbol extraction (35-symbol
-blocks to fit full frame). NOT YET TESTED ON LIVE BEACON — next step.
-
-### Step 2: LoRa Protocol Decode
-Convert raw symbols to bytes. This is the hard part — multiple layers:
-
-1. **De-gray code** — LoRa gray-codes symbols to minimize bit errors
-2. **De-interleave** — symbols are interleaved in blocks of (4+CR) across SF bits
-3. **Hamming FEC decode** — each codeword is (4+CR) bits, CR=1 means (5,4) Hamming
-4. **De-whiten** — XOR with LFSR pseudo-random sequence
-5. **Header decode** — first 8 symbols use reduced rate (SF-2 bits), contain
-   payload length and CR
-6. **CRC check** — CRC-16 on payload
-
-References for the exact algorithms:
-- Matt Knight's talk "Decoding LoRa" (DEF CON 24)
-- gr-lora by rpp0 (GNU Radio LoRa decoder, MIT license)
-- https://github.com/tapparelj/gr-lora_sdr (another reference implementation)
-
-Test approach: send "HELLO" from beacon, decode, verify output matches.
-
-### Step 3: Decode "HELLO"
-Integration test — full pipeline from raw IQ to decoded payload bytes.
-
-Build chirp_decode.py that:
-1. Reads IQ from SDR (sdr_source)
-2. Detects preamble (chirp_detect)
-3. Extracts symbols (step 1)
-4. Decodes to bytes (step 2)
-5. Prints decoded payload
-
-This is the "it works" demo. Once we can decode "HELLO" from the beacon,
-the Python prototype is complete and we can think about the C port.
-
-## Architecture Notes
-
-### File layout after completion
 ```
 lora/
-  sdr_source.py        — IQ from rtl_433 (done)
-  chirp_detect.py      — preamble detection (done, needs dedup)
-  chirp_demod.py       — symbol extraction from detected preamble (done)
-  lora_decode.py       — NEW: gray/interleave/hamming/whiten/CRC
-  chirp_waterfall.py   — visualization (done)
-  chirp_monitor.py     — CLI preamble detector (done)
-  chirp_decode.py      — NEW: full pipeline CLI
+  sdr_source.py        — IQ from rtl_433 subprocess (done)
+  chirp_detect.py      — preamble detection + estimate_parameters (done)
+  chirp_demod.py       — symbol extraction pipeline (partial)
+  chirp_waterfall.py   — matplotlib waterfall display (done)
+  chirp_monitor.py     — CLI detector with --scan, --demod (done)
+  analyze_capture.py   — offline IQ analysis tool (done)
+  sf_bw_detection.md   — experiment notes for SF/BW detection work
+  arduino/
+    lora_beacon_simple/    — fixed SF12/125k beacon
+    lora_beacon_SF_cycle/  — cycles SF7-12 at 125k
   tests/
-    test_chirp_detect.py   (done)
-    test_sdr_source.py     (done)
-    test_chirp_demod.py    — test symbol extraction with synthetic signals (done)
-    test_lora_decode.py    — NEW: test each decode stage with known vectors
+    test_chirp_detect.py   — 46 tests
+    test_chirp_demod.py    — 11 tests (2 known failures)
+    test_chirp_monitor.py  — 9 tests
+    test_sdr_source.py     — 7 tests
 ```
 
-### Key parameters confirmed from live testing
-- CS16 format, normalize by /32768.0
+## Key Technical Facts
+- CS16 format: 4 bytes/sample, int16 I/Q, normalized by /32768.0
 - Noise floor SNR: ~0 dB (corrected peak/median metric)
-- Real chirp SNR: ~7-8 dB
+- Real chirp SNR: ~7-12 dB depending on SF and conditions
 - Working threshold: 5 dB
-- Frequency offset: ~60 kHz (bins ~30600-31200 out of 32768)
-- Beacon interval: 3 seconds
-- Preamble: 8 chirps = 262 ms at SF12
-- Block size: 327680 samples (327.7 ms) works well
-- Quarter-symbol overlap (step = sym_len//4) sufficient for alignment
+- Beacon crystal offset: ~-30 to -50 kHz (bin ~950-1010 for SF7)
+- 915 MHz ISM band has 4+ other LoRa devices nearby
+
+## Performance Measurements
+| Mode | MSPS | % real-time | Notes |
+|------|------|-------------|-------|
+| SF7 only | 0.52 | 52% | reliable detection every ~3s |
+| SF scan (6 SFs) | ~0.07 | 7% | too slow, misses most blocks |
+| BW+SF scan (18) | 0.31 | 31% | dropped — too slow + unnecessary |
+
+## Known Issues
+
+### 1. Python too slow for multi-SF real-time
+Single SF at 1 MSPS is only 52% real-time. Multi-SF scan is infeasible
+in Python. Options: lower sample rate, pyfftw, round-robin SFs, or C port.
+
+### 2. Demod SFD alignment (+96 symbol offset)
+The 2.25-symbol SFD means data starts at 0.25-symbol offset from
+preamble alignment. Current extract_symbols doesn't account for this,
+producing a constant +96 offset (for SF7, 96 = 128 * 0.75).
+
+### 3. Demod frequency offset / timing coupling
+At 8x oversampling, timing error of dt samples shifts dechirp peak
+by (chirp_rate * dt / bin_spacing) bins. Must estimate freq offset
+at the same sub-symbol alignment as data extraction.
+
+### 4. chirp_demod.py has dead code
+Unused scipy import, experimental functions (fine_align,
+estimate_frequency_offset) that may not be needed in final approach.
+
+## Experiment Log
+See sf_bw_detection.md for detailed notes on BW detection experiments,
+hypotheses tested, and performance measurements.

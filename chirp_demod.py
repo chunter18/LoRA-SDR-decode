@@ -1,8 +1,9 @@
 """LoRa Symbol Demodulator — extract raw symbol values from IQ samples."""
 
 import numpy as np
+from scipy.signal import decimate as scipy_decimate
 from chirp_detect import (LoraParams, generate_chirp, dechirp_and_fft,
-                          detect_preamble, decimate_to_lora)
+                          detect_preamble)
 
 
 def generate_lora_frame(params, n_preamble=8, sync_word=None, payload_symbols=None):
@@ -96,7 +97,78 @@ def find_sfd(samples, params, preamble_end):
     return first_down + int(2.25 * sym_len)
 
 
-def extract_symbols(samples, params, data_offset, n_symbols):
+def fine_align(samples, params, coarse_start, search_range=None):
+    """Refine preamble timing by maximizing dechirped FFT peak.
+
+    Searches around coarse_start for the offset that produces the
+    sharpest dechirped peak (all chirp energy in one FFT bin).
+
+    Args:
+        samples: Complex IQ samples.
+        params: LoraParams.
+        coarse_start: Coarse preamble start (from detect_preamble).
+        search_range: Samples to search ± around coarse_start.
+                      Default: quarter-symbol.
+
+    Returns:
+        Refined sample offset (int).
+    """
+    sym_len = params.symbol_samples
+    if search_range is None:
+        search_range = sym_len // 4
+    ref_up_conj = np.conj(generate_chirp(params, direction='up'))
+
+    # Search step: ~1/32 of a symbol for good resolution
+    step = max(1, sym_len // 32)
+    lo = max(0, coarse_start - search_range)
+    hi = min(len(samples) - sym_len, coarse_start + search_range)
+
+    best_offset = coarse_start
+    best_peak = 0.0
+    for off in range(lo, hi + 1, step):
+        window = samples[off:off + sym_len]
+        spectrum = np.abs(np.fft.fft(window * ref_up_conj))
+        peak = np.max(spectrum)
+        if peak > best_peak:
+            best_peak = peak
+            best_offset = off
+
+    return best_offset
+
+
+def estimate_frequency_offset(samples, params, preamble_start, n_windows=4):
+    """Estimate frequency offset from preamble windows.
+
+    Preamble chirps have symbol value 0, so the dechirped peak bin
+    directly gives the frequency offset in FFT bins.
+
+    Args:
+        samples: Complex IQ samples.
+        params: LoraParams.
+        preamble_start: Sample offset of preamble start.
+        n_windows: Number of preamble windows to average.
+
+    Returns:
+        Frequency offset in FFT bins (float).
+    """
+    ref_up = generate_chirp(params, direction='up')
+    sym_len = params.symbol_samples
+    bins = []
+    for i in range(n_windows):
+        start = preamble_start + i * sym_len
+        end = start + sym_len
+        if end > len(samples):
+            break
+        window = samples[start:end]
+        _, peak_bin, _ = dechirp_and_fft(window, ref_up)
+        bins.append(peak_bin)
+    if not bins:
+        return 0.0
+    # Use circular median to handle wrapping near 0/sym_len
+    return float(np.median(bins))
+
+
+def extract_symbols(samples, params, data_offset, n_symbols, freq_offset=0.0):
     """Extract raw symbol values from the data region.
 
     Args:
@@ -104,6 +176,7 @@ def extract_symbols(samples, params, data_offset, n_symbols):
         params: LoraParams.
         data_offset: Sample offset where data symbols begin.
         n_symbols: Number of symbols to extract.
+        freq_offset: Frequency offset in FFT bins (from preamble).
 
     Returns:
         List of integer symbol values (0 to 2^SF - 1).
@@ -119,7 +192,9 @@ def extract_symbols(samples, params, data_offset, n_symbols):
             break
         window = samples[start:end]
         _, peak_bin, _ = dechirp_and_fft(window, ref_up)
-        symbol = peak_bin % params.n_chips
+        # Subtract frequency offset, then map to symbol range
+        corrected = (peak_bin - freq_offset) % sym_len
+        symbol = int(round(corrected)) % params.n_chips
         symbols.append(symbol)
 
     return symbols
@@ -127,8 +202,6 @@ def extract_symbols(samples, params, data_offset, n_symbols):
 
 def demodulate(samples, params, n_data_symbols=20, min_chirps=4, snr_threshold=5.0):
     """Full demodulation pipeline: detect preamble, find SFD, extract symbols.
-
-    Decimates to 2*BW for cleaner demodulation, then runs the full chain.
 
     Args:
         samples: Complex IQ samples at params.sample_rate.
@@ -140,36 +213,49 @@ def demodulate(samples, params, n_data_symbols=20, min_chirps=4, snr_threshold=5
     Returns:
         List of result dicts, each with:
           - 'symbols': list of raw symbol values
-          - 'preamble_offset': sample offset of preamble in decimated signal
-          - 'data_offset': sample offset of data region in decimated signal
+          - 'preamble_offset': sample offset of preamble
+          - 'data_offset': sample offset of data region
           - 'n_chirps': number of preamble chirps detected
           - 'snr_db': average preamble SNR
     """
-    dec_samples, dec_params = decimate_to_lora(samples, params)
-
-    detections = detect_preamble(dec_samples, dec_params,
+    detections = detect_preamble(samples, params,
                                  min_chirps=min_chirps,
                                  snr_threshold=snr_threshold)
     results = []
-    sym_len = dec_params.symbol_samples
+    sym_len = params.symbol_samples
 
     for det in detections:
         preamble_start = det['sample_offset']
-        preamble_end = preamble_start + det['n_chirps'] * sym_len
+        # Cap preamble length — detect_preamble may count sync/SFD/data
+        # as chirps too (especially in high-SNR conditions).
+        n_preamble = min(det['n_chirps'], 10)
+        preamble_end = preamble_start + n_preamble * sym_len
 
-        data_offset = find_sfd(dec_samples, dec_params, preamble_end)
+        data_offset = find_sfd(samples, params, preamble_end)
 
-        max_possible = (len(dec_samples) - data_offset) // sym_len
+        # Estimate frequency offset from preamble at the SAME sub-symbol
+        # alignment as data_offset. This ensures the timing-dependent
+        # frequency shift is consistent between offset estimation and
+        # data extraction.
+        # Walk back from data_offset into the preamble region.
+        n_back = (data_offset - preamble_start) // sym_len
+        preamble_at_data_align = data_offset - n_back * sym_len
+        freq_offset = estimate_frequency_offset(samples, params,
+                                                preamble_at_data_align,
+                                                n_windows=min(4, n_back))
+
+        max_possible = (len(samples) - data_offset) // sym_len
         n_to_extract = min(n_data_symbols, max_possible)
         if n_to_extract <= 0:
             continue
 
-        symbols = extract_symbols(dec_samples, dec_params, data_offset,
-                                  n_to_extract)
+        symbols = extract_symbols(samples, params, data_offset,
+                                  n_to_extract, freq_offset=freq_offset)
         results.append({
             'symbols': symbols,
             'preamble_offset': preamble_start,
             'data_offset': data_offset,
+            'freq_offset': freq_offset,
             'n_chirps': det['n_chirps'],
             'snr_db': det['snr_db'],
         })

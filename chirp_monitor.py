@@ -11,12 +11,13 @@ Usage:
 """
 
 import sys
+import os
 import argparse
 import time
 import numpy as np
 
 from sdr_source import start_sdr, read_iq_blocks, DEFAULT_FREQ, DEFAULT_SAMPLE_RATE, DEFAULT_BANDWIDTH
-from chirp_detect import LoraParams, detect_preamble, generate_chirp, dechirp_and_fft
+from chirp_detect import LoraParams, detect_preamble, generate_chirp, dechirp_and_fft, estimate_parameters
 from chirp_demod import demodulate
 
 
@@ -56,7 +57,10 @@ def main():
     parser.add_argument('--bw', type=float, default=125e3, help='LoRa bandwidth in Hz (default: 125000)')
     parser.add_argument('--threshold', type=float, default=5.0, help='SNR threshold in dB (default: 5.0)')
     parser.add_argument('--demod', action='store_true', help='Extract raw symbols after preamble detection')
+    parser.add_argument('--scan', action='store_true', help='Auto-detect SF and frequency (scans SF7-12 at fixed BW)')
     parser.add_argument('--debug', action='store_true', help='Print per-block peak SNR for diagnostics')
+    parser.add_argument('--iq-save', type=str, default=None, help='Save IQ blocks on detection to this directory')
+    parser.add_argument('--sample-rate', type=float, default=None, help='Override assumed sample rate (Hz)')
     args = parser.parse_args()
 
     # Parse SF range
@@ -66,7 +70,7 @@ def main():
     else:
         sf_list = [int(args.sf)]
 
-    sample_rate = DEFAULT_SAMPLE_RATE
+    sample_rate = args.sample_rate if args.sample_rate else DEFAULT_SAMPLE_RATE
 
     # Build params for each SF
     params_list = [
@@ -75,15 +79,34 @@ def main():
     ]
 
     # Use the largest symbol size for block reading
-    max_sym_samples = max(p.symbol_samples for p in params_list)
-    # With --demod, need room for preamble (8) + sync (2) + SFD (2.25) + data (~20)
-    n_symbols_per_block = 35 if args.demod else 10
+    if args.scan:
+        # In scan mode, need blocks large enough for the slowest SF at the configured BW.
+        # 10 symbols of SF12 gives enough room for 8-chirp preamble + alignment margin
+        # while keeping blocks small enough for near-real-time processing.
+        max_sym_samples = int((1 << 12) / args.bw * sample_rate)  # SF12 at configured BW
+        n_symbols_per_block = 10
+    else:
+        max_sym_samples = max(p.symbol_samples for p in params_list)
+        # With --demod, need room for preamble (8) + sync (2) + SFD (2.25) + data (~20)
+        n_symbols_per_block = 35 if args.demod else 10
     block_size = max_sym_samples * n_symbols_per_block
+
+    # Parse SDR center frequency for signal freq calculation
+    freq_str = args.freq
+    if freq_str.upper().endswith('M'):
+        sdr_center_hz = float(freq_str[:-1]) * 1e6
+    elif freq_str.upper().endswith('K'):
+        sdr_center_hz = float(freq_str[:-1]) * 1e3
+    else:
+        sdr_center_hz = float(freq_str)
 
     print(f"LoRa Chirp Monitor")
     print(f"  Frequency: {args.freq}")
-    print(f"  Spreading factors: {sf_list}")
-    print(f"  Bandwidth: {args.bw/1e3:.0f} kHz")
+    if args.scan:
+        print(f"  Mode: SF SCAN (SF7-12 at {args.bw/1e3:.0f} kHz BW)")
+    else:
+        print(f"  Spreading factors: {sf_list}")
+        print(f"  Bandwidth: {args.bw/1e3:.0f} kHz")
     print(f"  SNR threshold: {args.threshold:.1f} dB")
     print(f"  Block size: {block_size} samples ({block_size/sample_rate*1e3:.1f} ms)")
     print()
@@ -100,12 +123,14 @@ def main():
 
     detection_count = 0
     block_count = 0
+    bytes_received = 0
     start_time = time.time()
     dedup = Deduplicator()
 
     try:
         for samples in read_iq_blocks(proc, block_size=block_size):
             block_count += 1
+            bytes_received += len(samples) * 4  # CS16: 4 bytes per complex sample
             elapsed = time.time() - start_time
 
             # Noise floor estimate
@@ -113,7 +138,44 @@ def main():
             if args.debug:
                 print(f"[{elapsed:8.1f}s] noise floor: {noise_dbfs:.1f} dBFS", file=sys.stderr)
 
-            for params in params_list:
+            if args.scan:
+                # Auto-detect SF and frequency at fixed BW
+                result = estimate_parameters(
+                    samples, sample_rate,
+                    bw=args.bw,
+                    min_chirps=6,
+                    snr_threshold=args.threshold,
+                    verbose=args.debug,
+                )
+                if result is not None and result.get('score', 0) >= 3.0:
+                    sig_freq = sdr_center_hz + result['freq_offset_hz']
+                    # Dedup key: use detected SF
+                    det_params = LoraParams(sf=result['sf'], bw=result['bw'],
+                                           sample_rate=sample_rate)
+                    suppress_dur = 8 * det_params.symbol_duration + block_size / sample_rate
+                    if dedup.should_report(result['sf'], elapsed, suppress_dur):
+                        detection_count += 1
+                        print(
+                            f"[{elapsed:8.1f}s] "
+                            f"LoRa detected: "
+                            f"SF={result['sf']}, "
+                            f"BW={result['bw']/1e3:.0f} kHz, "
+                            f"freq={sig_freq/1e6:.4f} MHz, "
+                            f"chirps={result['n_chirps']}, "
+                            f"SNR={result['snr_db']:.1f} dB, "
+                            f"bin_std={result.get('bin_std', 0):.1f}, "
+                            f"score={result.get('score', 0):.1f}"
+                        )
+                        if args.iq_save:
+                            os.makedirs(args.iq_save, exist_ok=True)
+                            fname = os.path.join(
+                                args.iq_save,
+                                f"iq_{detection_count:04d}_SF{result['sf']}_{result['bw']/1e3:.0f}k.npy"
+                            )
+                            np.save(fname, samples)
+                            print(f"  -> saved {fname}", file=sys.stderr)
+            else:
+              for params in params_list:
                 # Debug: show per-window de-chirp results
                 if args.debug:
                     ref_conj = np.conj(generate_chirp(params, direction='up'))
@@ -148,6 +210,11 @@ def main():
                         min_chirps=6,
                         snr_threshold=args.threshold,
                     )
+                    if not results and args.debug:
+                        # Check if raw detection works (without decimation)
+                        raw_det = detect_preamble(samples, params, min_chirps=6, snr_threshold=args.threshold)
+                        if raw_det:
+                            print(f"[{elapsed:8.1f}s] DEBUG: raw detection OK (SNR={raw_det[0]['snr_db']:.1f}) but demodulate() returned empty", file=sys.stderr)
                     for r in results:
                         suppress_dur = 8 * params.symbol_duration + block_size / sample_rate
                         if not dedup.should_report(params.sf, elapsed, suppress_dur):
@@ -160,6 +227,8 @@ def main():
                             f"chirps={r['n_chirps']}, "
                             f"SNR={r['snr_db']:.1f} dB, "
                             f"noise={noise_dbfs:.1f} dBFS, "
+                            f"offset={r.get('freq_offset', '?')}, "
+                            f"data@{r['data_offset']}, "
                             f"{len(syms)} symbols: {syms}"
                         )
                 else:
@@ -188,9 +257,13 @@ def main():
 
             # Periodic status
             if block_count % 50 == 0:
+                measured_rate = bytes_received / 4 / elapsed if elapsed > 0 else 0
+                rt_ratio = measured_rate / sample_rate if sample_rate > 0 else 0
                 print(
                     f"[{elapsed:8.1f}s] "
-                    f"... {detection_count} detections in {block_count} blocks",
+                    f"... {detection_count} detections in {block_count} blocks, "
+                    f"{measured_rate/1e6:.3f} MSPS "
+                    f"({rt_ratio:.2f}x real-time)",
                     file=sys.stderr,
                 )
 

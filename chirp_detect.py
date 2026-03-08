@@ -179,7 +179,7 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
     """
     ref_up = generate_chirp(params, direction='up')
     sym_len = params.symbol_samples
-    step = sym_len // 4  # 75% overlap for alignment tolerance
+    step = sym_len // 2  # 50% overlap for alignment tolerance
     n_total = len(samples)
 
     if n_total < sym_len * min_chirps:
@@ -190,36 +190,51 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
 
     # Try multiple starting offsets (quarter-symbol steps)
     best_detection = None
+    best_score = -np.inf
+
+    noise_baseline = 10 * np.log10(np.log2(sym_len)) if sym_len > 1 else 0
 
     for start in range(0, sym_len, step):
-        # From this starting offset, de-chirp at symbol intervals
-        windows = []
-        offset = start
-        while offset + sym_len <= n_total:
-            window = samples[offset:offset + sym_len]
-            spectrum = np.abs(np.fft.fft(window * ref_conj))
-            peak_bin = int(np.argmax(spectrum))
-            peak_power = spectrum[peak_bin]
-            median_power = np.median(spectrum)
-            if median_power > 0:
-                raw_snr = 20 * np.log10(peak_power / median_power)
-                noise_baseline = 10 * np.log10(np.log2(len(spectrum)))
-                snr_db = float(raw_snr - noise_baseline)
-            else:
-                snr_db = 0.0
-            windows.append({
-                'bin': peak_bin,
-                'snr': snr_db,
-                'offset': offset,
-            })
-            offset += sym_len
+        # Batch all windows into a 2D array for vectorized FFT
+        n_windows = (n_total - start) // sym_len
+        if n_windows < min_chirps:
+            continue
+
+        # Reshape signal into non-overlapping windows from this offset
+        end = start + n_windows * sym_len
+        windowed = samples[start:end].reshape(n_windows, sym_len)
+
+        # Batch dechirp + FFT (one call for all windows)
+        dechirped = windowed * ref_conj[np.newaxis, :]
+        spectra = np.abs(np.fft.fft(dechirped, axis=1))
+
+        # Vectorized peak finding and SNR
+        peak_bins = np.argmax(spectra, axis=1)
+        peak_powers = spectra[np.arange(n_windows), peak_bins]
+        median_powers = np.median(spectra, axis=1)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw_snrs = np.where(
+                median_powers > 0,
+                20 * np.log10(peak_powers / median_powers) - noise_baseline,
+                0.0,
+            )
+
+        offsets = start + np.arange(n_windows) * sym_len
+        windows = [
+            {'bin': int(peak_bins[i]), 'snr': float(raw_snrs[i]), 'offset': int(offsets[i])}
+            for i in range(n_windows)
+        ]
 
         # Find runs of consecutive high-SNR windows
         detections = _find_snr_runs(windows, min_chirps, snr_threshold)
 
         for d in detections:
-            if best_detection is None or d['snr_db'] > best_detection['snr_db']:
+            # Prefer detections with consistent bins (low bin_std)
+            d_score = d['snr_db'] / (1 + d.get('bin_std', 0) / 5.0)
+            if d_score > best_score:
                 best_detection = d
+                best_score = d_score
 
     return [best_detection] if best_detection else []
 
@@ -241,11 +256,15 @@ def _find_snr_runs(windows, min_chirps, snr_threshold):
             run_bins.append(w['bin'])
         else:
             if run_start is not None and len(run_snrs) >= min_chirps:
+                # bin_std from first 8 windows only (preamble region, before
+                # sync/SFD/data change the peak bin)
+                preamble_bins = run_bins[:8]
                 detections.append({
                     'sample_offset': windows[run_start]['offset'],
                     'n_chirps': len(run_snrs),
                     'snr_db': float(np.mean(run_snrs)),
-                    'peak_bin': int(np.median(run_bins)),
+                    'peak_bin': int(np.median(preamble_bins)),
+                    'bin_std': float(np.std(preamble_bins)),
                 })
             run_start = None
             run_snrs = []
@@ -253,14 +272,97 @@ def _find_snr_runs(windows, min_chirps, snr_threshold):
 
     # Check final run
     if run_start is not None and len(run_snrs) >= min_chirps:
+        preamble_bins = run_bins[:8]
         detections.append({
             'sample_offset': windows[run_start]['offset'],
             'n_chirps': len(run_snrs),
             'snr_db': float(np.mean(run_snrs)),
-            'peak_bin': int(np.median(run_bins)),
+            'peak_bin': int(np.median(preamble_bins)),
+            'bin_std': float(np.std(preamble_bins)),
         })
 
     return detections
+
+
+def bin_to_freq_offset(peak_bin, n_fft, sample_rate):
+    """Convert FFT peak bin to frequency offset in Hz.
+
+    Handles wrapping: bins above n_fft/2 map to negative frequencies.
+    """
+    if peak_bin > n_fft // 2:
+        peak_bin -= n_fft
+    return peak_bin * sample_rate / n_fft
+
+
+def estimate_parameters(samples, sample_rate,
+                        sf_candidates=None, bw=125e3,
+                        min_chirps=4, snr_threshold=5.0,
+                        verbose=False):
+    """Estimate LoRa SF and frequency offset by scanning SFs at a fixed BW.
+
+    Args:
+        samples: Complex IQ samples.
+        sample_rate: SDR sample rate in Hz.
+        sf_candidates: List of SFs to try (default: [7..12]).
+        bw: LoRa bandwidth in Hz (default: 125e3). Fixed, not auto-detected.
+        min_chirps: Minimum preamble chirps for detection.
+        snr_threshold: SNR threshold in dB.
+        verbose: If True, print all candidate scores to stderr.
+
+    Returns:
+        Dict with 'sf', 'bw', 'freq_offset_hz', 'snr_db', 'n_chirps',
+        'sample_offset', 'peak_bin' — or None if nothing detected.
+    """
+    if sf_candidates is None:
+        sf_candidates = list(range(7, 13))
+
+    best = None
+    best_score = -np.inf
+    for sf in sf_candidates:
+        params = LoraParams(sf=sf, bw=bw, sample_rate=sample_rate)
+        if params.symbol_samples * min_chirps > len(samples):
+            continue
+        detections = detect_preamble(samples, params,
+                                     min_chirps=min_chirps,
+                                     snr_threshold=snr_threshold)
+        for det in detections:
+            # Score: SNR penalized by bin inconsistency and chirp count.
+            # For correct SF, preamble bins are consistent (std ~0-5)
+            # and chirp count is 6-12. Wrong SF/BW produces wandering bins
+            # and/or very high chirp counts (many windows fit in one preamble).
+            bin_std = det.get('bin_std', 0)
+            n = det['n_chirps']
+            chirp_factor = min(n, 12) / n  # 1.0 for n<=12, shrinks for n>12
+            score = det['snr_db'] / (1 + bin_std / 5.0) * chirp_factor
+            if verbose:
+                import sys as _sys
+                print(
+                    f"  SF{sf}/{bw/1e3:.0f}k: "
+                    f"SNR={det['snr_db']:.1f}, "
+                    f"chirps={n}, "
+                    f"bin_std={bin_std:.1f}, "
+                    f"chirp_factor={chirp_factor:.2f}, "
+                    f"score={score:.1f}, "
+                    f"bin={det['peak_bin']}",
+                    file=_sys.stderr,
+                )
+            if score > best_score:
+                best_score = score
+                freq_hz = bin_to_freq_offset(det['peak_bin'],
+                                              params.symbol_samples,
+                                              sample_rate)
+                best = {
+                    'sf': sf,
+                    'bw': bw,
+                    'freq_offset_hz': freq_hz,
+                    'snr_db': det['snr_db'],
+                    'n_chirps': det['n_chirps'],
+                    'sample_offset': det['sample_offset'],
+                    'peak_bin': det['peak_bin'],
+                    'bin_std': bin_std,
+                    'score': score,
+                }
+    return best
 
 
 def generate_lora_preamble(params, n_chirps=8, payload_symbols=None):
@@ -284,5 +386,55 @@ def generate_lora_preamble(params, n_chirps=8, payload_symbols=None):
             shift = int(sym_val * sym_len / params.n_chips)
             shifted = np.roll(up, -shift)
             signal = np.concatenate([signal, shifted])
+
+    return signal
+
+
+def generate_lora_packet(params, n_preamble=8, sync_word=0x12,
+                         data_symbols=None):
+    """Generate a realistic LoRa packet with preamble, sync, SFD, and data.
+
+    Mimics the SX1276 packet structure:
+      - n_preamble up-chirps (unmodulated)
+      - 2 sync word chirps (shifted by sync_word nibbles)
+      - 2.25 SFD down-chirps
+      - data symbols (shifted up-chirps)
+
+    Args:
+        params: LoraParams.
+        n_preamble: Number of preamble up-chirps (default 8).
+        sync_word: LoRa sync word byte (default 0x12).
+        data_symbols: List of data symbol values (default: 5 random symbols).
+
+    Returns:
+        Complex64 numpy array of the full packet.
+    """
+    up = generate_chirp(params, direction='up')
+    down = generate_chirp(params, direction='down')
+    sym_len = params.symbol_samples
+
+    # Preamble: n unmodulated up-chirps
+    signal = np.tile(up, n_preamble)
+
+    # Sync word: 2 chirps shifted by sync_word nibbles
+    # SX1276 uses high and low nibbles of sync_word
+    sync_hi = (sync_word >> 4) & 0x0F
+    sync_lo = sync_word & 0x0F
+    for nibble in [sync_hi, sync_lo]:
+        shift = int(nibble * sym_len / params.n_chips) * (params.n_chips // 16)
+        shifted = np.roll(up, -shift)
+        signal = np.concatenate([signal, shifted])
+
+    # SFD: 2.25 down-chirps
+    signal = np.concatenate([signal, down, down, down[:sym_len // 4]])
+
+    # Data symbols
+    if data_symbols is None:
+        rng = np.random.default_rng(42)
+        data_symbols = rng.integers(0, params.n_chips, size=5).tolist()
+    for sym_val in data_symbols:
+        shift = int(sym_val * sym_len / params.n_chips)
+        shifted = np.roll(up, -shift)
+        signal = np.concatenate([signal, shifted])
 
     return signal
