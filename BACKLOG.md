@@ -1,55 +1,56 @@
 # LoRa Chirp Detector — Backlog
 
 ## Current Status
-- Preamble detection WORKS on live SF12 beacon (~19 dB SNR, 6-9 chirps per detection)
+- Preamble detection WORKS at real-time (1.0 MSPS) via rx_sdr backend
+- Multi-SF scanning (SF7-12) runs at real-time, but has cross-SF false positives
 - Symbol demodulation WORKS on synthetic signals (all SFs, with noise)
-- Beacon: RFM95W on Arduino, SF12/125kHz, "HELLO" every 3 seconds
-- SDR: Pluto via rtl_433 -w - (CS16 format, 1 MHz sample rate)
+- Beacon: RFM95W on Arduino, SF7/125kHz or SF7-12 cycle, "HELLO" every 3 seconds
+- SDR: Pluto via rx_sdr (CS16 format, 1 MHz sample rate)
 - 55/55 tests passing
 
-## Known Issues to Fix First
+## SDR Backend
+Switched from rtl_433 to rx_sdr as default IQ source. rtl_433 runs its full
+signal processing pipeline (AM/FM demod, pulse detection, filtering) even when
+only dumping raw IQ with `-w -`, limiting throughput to 0.6 MSPS. rx_sdr is a
+lightweight SoapySDR streamer that achieves full 1.0 MSPS. See
+`sdr_throughput_findings.md` for details. Old backend available via
+`--backend rtl_433`.
 
-### ~~1. Deduplicate detections~~ DONE
+## SF Scan Mode (Provisional)
+Multi-SF detection (SF7-12) runs at real-time by:
+- Block size: 10 × max_symbol_samples (327,680 for SF12 = 328 ms)
+- Single alignment offset when scanning (vs 2 for single-SF)
+- Batch FFT per SF per block
+
+**Known accuracy issue:** Cross-SF false positives. A beacon transmitting at
+SF7 can produce false detections at SF8, SF9, etc. Confirmed by turning off
+the beacon — zero detections with beacon off, ruling out other devices.
+There is no reliable way to validate SF accuracy without decoding the payload.
+Plan: get decoding working, then transmit the SF value in the payload and
+measure detection accuracy against ground truth.
+
+## Completed
+
+### Deduplication
 Preambles spanning two blocks produced two detections ~0.7s apart.
-Fixed: `Deduplicator` class in chirp_monitor.py suppresses detections within
-(preamble_duration + block_duration) of the last. Verified on live beacon:
-exactly one detection per 3s transmission.
+Fixed: `Deduplicator` class suppresses within (preamble + block duration).
 
-### 2. Bin variance is high (~1000 bins spread)
-De-chirped peak bins wander by ~1000 across a single preamble. Likely causes:
-- 8x oversampling (1 MHz sample rate vs 125 kHz BW) means only 4096 of 32768
-  bins are in the LoRa band — small alignment errors move peak a lot
-- Crystal frequency offset (~60 kHz) between Pluto and RFM95W
+### SNR Metric
+Corrected peak/median: `raw - 10*log10(log2(N_bins))`. Noise reads ~0 dB,
+signal ~6-11 dB. Consistent across FFT sizes.
 
-`decimate_to_lora()` added to chirp_detect.py — FFT-based brick-wall filter +
-downsample to 2*BW (250 kHz). Tested and working on synthetic signals.
-NOT yet integrated into detection pipeline because the peak/median SNR metric
-gives ~6 dB lower values at 8192 bins vs 32768 bins (fewer noise bins to
-average over), causing detections to fall below threshold. Fix #3 (better SNR
-metric) should resolve this. Decimation will be used for symbol demodulation.
+### Symbol Demodulation (synthetic only)
+chirp_demod.py: `generate_lora_frame()`, `find_sfd()`, `extract_symbols()`,
+`demodulate()`. Not yet tested on live signals.
 
-### ~~3. Noise floor SNR metric~~ DONE
-The old peak/median SNR gave ~11-12 dB on pure noise (max of N Rayleigh RVs
-exceeds median by ~sqrt(log2(N))). Fixed by subtracting the expected noise
-baseline: `corrected = raw - 10*log10(log2(N_bins))`. Now noise reads ~0 dB,
-signal ~7-8 dB, with default threshold lowered to 5.0 dB (~7 dB margin vs
-the old ~4 dB). Metric is consistent across FFT sizes (tested SF7 and SF12).
+### Real-time Throughput
+rx_sdr backend delivers 1.0 MSPS. Processing at 10-13 MSPS (single SF) or
+~3 MSPS (6 SFs) — well within budget. See `sdr_throughput_findings.md`.
 
 ## Next Steps (in order)
 
-### ~~Step 1: Symbol Demodulation~~ DONE
-chirp_demod.py implements:
-- `generate_lora_frame()` — synthetic frame generator for testing
-- `find_sfd()` — locates SFD down-chirps via up/down energy comparison
-- `extract_symbols()` — dechirp + FFT per symbol, full FFT gives direct
-  bin-to-symbol mapping regardless of oversampling rate
-- `demodulate()` — full pipeline: decimate → detect → find_sfd → extract
-
-chirp_monitor.py `--demod` flag enables live symbol extraction (35-symbol
-blocks to fit full frame). NOT YET TESTED ON LIVE BEACON — next step.
-
-### Step 2: LoRa Protocol Decode
-Convert raw symbols to bytes. This is the hard part — multiple layers:
+### Step 1: LoRa Protocol Decode
+Convert raw symbols to bytes. Multiple layers:
 
 1. **De-gray code** — LoRa gray-codes symbols to minimize bit errors
 2. **De-interleave** — symbols are interleaved in blocks of (4+CR) across SF bits
@@ -59,52 +60,51 @@ Convert raw symbols to bytes. This is the hard part — multiple layers:
    payload length and CR
 6. **CRC check** — CRC-16 on payload
 
-References for the exact algorithms:
+References:
 - Matt Knight's talk "Decoding LoRa" (DEF CON 24)
 - gr-lora by rpp0 (GNU Radio LoRa decoder, MIT license)
-- https://github.com/tapparelj/gr-lora_sdr (another reference implementation)
+- https://github.com/tapparelj/gr-lora_sdr
 
-Test approach: send "HELLO" from beacon, decode, verify output matches.
+### Step 2: Decode "HELLO"
+Full pipeline from raw IQ to decoded payload bytes. Once working, modify
+beacon to transmit SF value in payload and use that as ground truth to
+measure SF detection accuracy.
 
-### Step 3: Decode "HELLO"
-Integration test — full pipeline from raw IQ to decoded payload bytes.
-
-Build chirp_decode.py that:
-1. Reads IQ from SDR (sdr_source)
-2. Detects preamble (chirp_detect)
-3. Extracts symbols (step 1)
-4. Decodes to bytes (step 2)
-5. Prints decoded payload
-
-This is the "it works" demo. Once we can decode "HELLO" from the beacon,
-the Python prototype is complete and we can think about the C port.
+### Step 3: Validate SF Detection
+With decode working, transmit known SF in payload, compare detected SF vs
+decoded SF. Use this to tune thresholds and fix cross-SF false positives.
 
 ## Architecture Notes
 
-### File layout after completion
+### File layout
 ```
 lora/
-  sdr_source.py        — IQ from rtl_433 (done)
-  chirp_detect.py      — preamble detection (done, needs dedup)
-  chirp_demod.py       — symbol extraction from detected preamble (done)
+  sdr_source.py        — IQ from rx_sdr or rtl_433 (done)
+  chirp_detect.py      — preamble detection (done)
+  chirp_demod.py       — symbol extraction (done, synthetic only)
   lora_decode.py       — NEW: gray/interleave/hamming/whiten/CRC
   chirp_waterfall.py   — visualization (done)
-  chirp_monitor.py     — CLI preamble detector (done)
+  chirp_monitor.py     — CLI detector with SF scan (done)
   chirp_decode.py      — NEW: full pipeline CLI
+  sdr_throughput_findings.md — rtl_433 vs rx_sdr analysis
+  arduino/
+    lora_beacon_simple/    — fixed SF12/125k beacon
+    lora_beacon_SF_cycle/  — cycles SF7-12
   tests/
-    test_chirp_detect.py   (done)
-    test_sdr_source.py     (done)
-    test_chirp_demod.py    — test symbol extraction with synthetic signals (done)
-    test_lora_decode.py    — NEW: test each decode stage with known vectors
+    test_chirp_detect.py   (done, 27 tests)
+    test_sdr_source.py     (done, 7 tests)
+    test_chirp_demod.py    (done, 12 tests)
+    test_chirp_monitor.py  (done, 9 tests)
+    test_lora_decode.py    — NEW
 ```
 
 ### Key parameters confirmed from live testing
-- CS16 format, normalize by /32768.0
-- Noise floor SNR: ~0 dB (corrected peak/median metric)
-- Real chirp SNR: ~7-8 dB
-- Working threshold: 5 dB
-- Frequency offset: ~60 kHz (bins ~30600-31200 out of 32768)
+- rx_sdr backend: full 1.0 MSPS throughput
+- rtl_433 backend: 0.6 MSPS (internal DSP overhead)
+- Noise floor SNR: ~0 dB (corrected metric)
+- Real chirp SNR: ~6-11 dB
+- Working threshold: 4-5 dB
+- Frequency offset: ~30-50 kHz between Pluto and RFM95W crystals
 - Beacon interval: 3 seconds
-- Preamble: 8 chirps = 262 ms at SF12
-- Block size: 327680 samples (327.7 ms) works well
-- Quarter-symbol overlap (step = sym_len//4) sufficient for alignment
+- Block size: 327,680 samples (328 ms) for multi-SF scan
+- Single alignment offset sufficient for 8-chirp preambles

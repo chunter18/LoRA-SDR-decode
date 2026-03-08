@@ -79,8 +79,9 @@ def main():
     # Use the largest symbol size for block reading
     max_sym_samples = max(p.symbol_samples for p in params_list)
     # With --demod, need room for preamble (8) + sync (2) + SFD (2.25) + data (~20)
-    # For detection-only, use large blocks to minimize per-block Python overhead
-    n_symbols_per_block = 35 if args.demod else 100
+    # For detection-only, 10 symbols of the largest SF gives enough preamble
+    # coverage while keeping latency reasonable (~328 ms for SF12)
+    n_symbols_per_block = 35 if args.demod else 10
     block_size = max_sym_samples * n_symbols_per_block
 
     print(f"LoRa Chirp Monitor")
@@ -103,6 +104,7 @@ def main():
     print()
 
     detection_count = 0
+    sf_counts = {}  # sf -> count
     block_count = 0
     start_time = time.time()
     dedup = Deduplicator()
@@ -157,6 +159,7 @@ def main():
                         if not dedup.should_report(params.sf, elapsed, suppress_dur):
                             continue
                         detection_count += 1
+                        sf_counts[params.sf] = sf_counts.get(params.sf, 0) + 1
                         syms = r['symbols']
                         print(
                             f"[{elapsed:8.1f}s] "
@@ -171,6 +174,7 @@ def main():
                         samples, params,
                         min_chirps=6,
                         snr_threshold=args.threshold,
+                        n_offsets=1 if len(params_list) > 1 else 2,
                     )
 
                     for d in detections:
@@ -180,6 +184,7 @@ def main():
                         if not dedup.should_report(params.sf, elapsed, suppress_dur):
                             continue
                         detection_count += 1
+                        sf_counts[params.sf] = sf_counts.get(params.sf, 0) + 1
                         print(
                             f"[{elapsed:8.1f}s] "
                             f"LoRa preamble detected: "
@@ -192,9 +197,11 @@ def main():
 
             # Periodic status
             if block_count % 50 == 0:
+                sf_summary = " ".join(f"SF{sf}:{n}" for sf, n in sorted(sf_counts.items()))
                 print(
                     f"[{elapsed:8.1f}s] "
-                    f"... {detection_count} detections in {block_count} blocks",
+                    f"... {detection_count} detections in {block_count} blocks"
+                    f" [{sf_summary}]",
                     file=sys.stderr,
                 )
 

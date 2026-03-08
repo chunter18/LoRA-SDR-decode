@@ -157,7 +157,8 @@ def dechirp_and_fft(samples, ref_chirp, n_fft=None):
     return magnitudes, int(peak_bin), float(snr_db)
 
 
-def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
+def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0,
+                    n_offsets=2):
     """Scan samples for a LoRa preamble (repeated up-chirps).
 
     Uses overlapping windows to handle arbitrary chirp alignment.
@@ -169,6 +170,7 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
         params: LoraParams.
         min_chirps: Minimum consecutive high-SNR windows to count as preamble.
         snr_threshold: Minimum SNR in dB for a window to count as a chirp.
+        n_offsets: Number of starting offsets to try (1=fast, 2=default).
 
     Returns:
         List of detection dicts, each with:
@@ -179,7 +181,7 @@ def detect_preamble(samples, params, min_chirps=4, snr_threshold=5.0):
     """
     ref_up = generate_chirp(params, direction='up')
     sym_len = params.symbol_samples
-    step = sym_len // 2  # 50% overlap for alignment tolerance
+    step = sym_len // n_offsets
     n_total = len(samples)
 
     if n_total < sym_len * min_chirps:
